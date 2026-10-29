@@ -15,23 +15,85 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 const DATA_FILE = process.env.DATA_FILE || './social-data.json';
+// Kalıcı depolama (ücretsiz): Upstash Redis. İki değişken de doluysa kullanılır, yoksa dosyaya yazılır.
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const useRedis = Boolean(REDIS_URL && REDIS_TOKEN);
+
 const ONLINE_MS = 75 * 1000;      // son sinyalden bu yana 75 sn geçmediyse "çevrim içi"
-const MAX_SONGS = 200;
-const MAX_INBOX = 50;
+const MAX_SONGS = 100;
+const MAX_INBOX = 20;
 const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
 
 // users: username(lowercase) -> { username, tokenHash, lastSeen, friends:[lc], incoming:[lc], outgoing:[lc], inbox:[...] }
-let users = {};
-try { users = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch (e) { users = {}; }
+// lastSeen yalnızca bellekte tutulur (kaydedilmez): böylece her sinyal veritabanına yazı yapmaz.
+const users = {};
+const ser = (u) => JSON.stringify(u, (k, v) => (k === 'lastSeen' ? undefined : v));
 
-let saveTimer = null;
-function save() {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    fs.writeFile(DATA_FILE, JSON.stringify(users), (err) => { if (err) console.error('Kayıt hatası:', err.message); });
-  }, 1000);
-  saveTimer.unref();
+async function redis(cmds) {
+  const r = await fetch(REDIS_URL + '/pipeline', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + REDIS_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify(cmds)
+  });
+  if (!r.ok) throw new Error('Redis ' + r.status);
+  const out = await r.json();
+  const bad = out.find((x) => x && x.error);
+  if (bad) throw new Error('Redis: ' + bad.error);
+  return out;
+}
+
+async function loadAll() {
+  if (useRedis) {
+    const [m] = await redis([['SMEMBERS', 'users']]);
+    const names = m.result || [];
+    for (let i = 0; i < names.length; i += 100) {
+      const chunk = names.slice(i, i + 100);
+      const [res] = await redis([['MGET', ...chunk.map((n) => 'u:' + n)]]);
+      (res.result || []).forEach((v) => {
+        if (!v) return;
+        try { const u = JSON.parse(v); u.lastSeen = 0; users[String(u.username).toLowerCase()] = u; } catch (e) { /* bozuk kayıt */ }
+      });
+    }
+  } else {
+    try {
+      const all = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      for (const [k, u] of Object.entries(all)) { u.lastSeen = 0; users[k] = u; }
+    } catch (e) { /* ilk çalışma */ }
+  }
+}
+
+let loaded = false, loadPromise = null;
+async function ensureLoaded() {
+  if (loaded) return true;
+  try { await (loadPromise = loadPromise || loadAll()); loaded = true; return true; }
+  catch (e) { loadPromise = null; console.error('Veri yüklenemedi:', e.message); return false; }
+}
+
+const dirty = new Set();
+let timer = null;
+function touch(...us) {
+  for (const u of us) if (u) dirty.add(String(u.username).toLowerCase());
+  if (!timer) timer = setTimeout(flush, 1000);
+}
+async function flush(retryMs) {
+  timer = null;
+  const names = [...dirty];
+  dirty.clear();
+  if (names.length === 0) return;
+  try {
+    if (useRedis) {
+      const cmds = [];
+      for (const n of names) if (users[n]) { cmds.push(['SET', 'u:' + n, ser(users[n])]); cmds.push(['SADD', 'users', n]); }
+      if (cmds.length) await redis(cmds);
+    } else {
+      await fs.promises.writeFile(DATA_FILE, ser(users));
+    }
+  } catch (e) {
+    console.error('Kayıt hatası:', e.message);
+    names.forEach((n) => dirty.add(n));
+    if (!timer) timer = setTimeout(flush, 10000);   // 10 sn sonra tekrar dene
+  }
 }
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
@@ -77,6 +139,7 @@ function cleanSongs(songs) {
 // handle: yönetildiyse true döner. reply(status, obj) sunucudan gelir.
 async function handle(req, res, path, body, ip, reply) {
   if (!path.startsWith('/social/')) return false;
+  if (!(await ensureLoaded())) { reply(res, 503, { error: 'Sunucu veritabanına ulaşamıyor. Biraz sonra tekrar dene.' }); return true; }
 
   if (path === '/social/join') {
     const now = Date.now();
@@ -88,7 +151,7 @@ async function handle(req, res, path, body, ip, reply) {
     if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }
     const token = crypto.randomBytes(24).toString('hex');
     users[lc(name)] = { username: name, tokenHash: sha(token), lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [] };
-    save();
+    touch(users[lc(name)]);
     reply(res, 200, { token, username: name });
     return true;
   }
@@ -99,13 +162,11 @@ async function handle(req, res, path, body, ip, reply) {
   switch (path) {
     case '/social/heartbeat':
       me.lastSeen = Date.now();
-      save();
       reply(res, 200, { ok: true });
       return true;
 
     case '/social/offline':
       me.lastSeen = Date.now() - ONLINE_MS;   // çevrim dışı say ama son görülme zamanı kalsın
-      save();
       reply(res, 200, { ok: true });
       return true;
 
@@ -134,7 +195,7 @@ async function handle(req, res, path, body, ip, reply) {
       } else {
         me.outgoing.push(b); t.incoming.push(a);
       }
-      save();
+      touch(me, t);
       reply(res, 200, { ok: true });
       return true;
     }
@@ -145,7 +206,7 @@ async function handle(req, res, path, body, ip, reply) {
       if (!t || !me.incoming.includes(b)) { reply(res, 404, { error: 'İstek bulunamadı.' }); return true; }
       me.incoming = without(me.incoming, b); t.outgoing = without(t.outgoing, a);
       if (body.accept === true) { me.friends.push(b); t.friends.push(a); }
-      save();
+      touch(me, t);
       reply(res, 200, { ok: true });
       return true;
     }
@@ -155,7 +216,7 @@ async function handle(req, res, path, body, ip, reply) {
       const t = users[b];
       me.friends = without(me.friends, b); me.outgoing = without(me.outgoing, b); me.incoming = without(me.incoming, b);
       if (t) { t.friends = without(t.friends, a); t.outgoing = without(t.outgoing, a); t.incoming = without(t.incoming, a); }
-      save();
+      touch(me, t);
       reply(res, 200, { ok: true });
       return true;
     }
@@ -165,6 +226,7 @@ async function handle(req, res, path, body, ip, reply) {
       if (songs.length === 0) { reply(res, 400, { error: 'Paylaşılacak şarkı yok. Cihazdan yüklenen şarkılar paylaşılamaz.' }); return true; }
       const targets = Array.isArray(body.to) ? body.to.slice(0, 20) : [];
       let sent = 0;
+      const changed = [];
       for (const n of targets) {
         const t = users[lc(n)];
         if (!t || !me.friends.includes(lc(t.username))) continue;   // yalnızca arkadaşlara
@@ -176,9 +238,10 @@ async function handle(req, res, path, body, ip, reply) {
           at: Date.now()
         });
         t.inbox = t.inbox.slice(0, MAX_INBOX);
+        changed.push(t);
         sent++;
       }
-      save();
+      touch(...changed);
       reply(res, 200, { ok: true, sent });
       return true;
     }
@@ -189,7 +252,7 @@ async function handle(req, res, path, body, ip, reply) {
 
     case '/social/inbox-dismiss':
       me.inbox = me.inbox.filter((i) => i.id !== body.id);
-      save();
+      touch(me);
       reply(res, 200, { ok: true });
       return true;
 
