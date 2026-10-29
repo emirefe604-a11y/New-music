@@ -12,8 +12,9 @@
 //  /social/share           { to: [username], name, songs } -> { ok, sent }
 //  /social/inbox           {}                              -> { items }
 //  /social/inbox-dismiss   { id }                          -> { ok }
+//  /social/search          { q }                           -> { users: [{ username, avatarV, relation }] }   (relation: none|friend|outgoing|incoming)
 //  /social/avatar          { image: base64 JPEG | null }   -> { ok, avatarV }   (profil resmi yükle / kaldır)
-//  GET /social/avatar/<kullanıcı>?v=<sürüm>                -> JPEG (yalnızca kendisi, arkadaşları ve istek atanlar görebilir)
+//  GET /social/avatar/<kullanıcı>?v=<sürüm>                -> JPEG (giriş yapmış kullanıcılar görebilir)
 const crypto = require('crypto');
 const fs = require('fs');
 
@@ -270,6 +271,23 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
     }
 
+    case '/social/search': {
+      const q = lc(body.q).replace(/[^a-z0-9_.]/g, '').slice(0, 20);
+      if (q.length < 2) { reply(res, 200, { users: [] }); return true; }
+      const mine = lc(me.username);
+      const hits = [];
+      for (const [k, u] of Object.entries(users)) {
+        if (k === mine) continue;
+        const at = k.indexOf(q);
+        if (at < 0) continue;
+        const relation = me.friends.includes(k) ? 'friend' : me.outgoing.includes(k) ? 'outgoing' : me.incoming.includes(k) ? 'incoming' : 'none';
+        hits.push({ username: u.username, avatarV: u.avatarV || 0, relation, at });
+      }
+      hits.sort((x, y) => x.at - y.at || x.username.length - y.username.length || x.username.localeCompare(y.username));
+      reply(res, 200, { users: hits.slice(0, 8).map(({ at, ...r }) => r) });
+      return true;
+    }
+
     case '/social/avatar': {
       if (body.image === null || body.image === '') {          // kaldır
         delete me.avatar; me.avatarV = 0; touch(me);
@@ -334,7 +352,7 @@ async function handle(req, res, path, body, ip, reply) {
   }
 }
 
-// GET /social/avatar/<kullanıcı>: profil resmini döndürür. Kendisi, arkadaşları ve bekleyen istek sahipleri görebilir.
+// GET /social/avatar/<kullanıcı>: profil resmini döndürür (giriş yapmış kullanıcılar; arama sonuçlarında da görünsün diye).
 async function handleGet(req, res, path) {
   const m = /^\/social\/avatar\/([a-zA-Z0-9_.]{3,20})$/.exec(path);
   if (!m) return false;
@@ -344,9 +362,6 @@ async function handleGet(req, res, path) {
   if (!me) return fail(401);
   const t = users[lc(m[1])];
   if (!t || !t.avatar) return fail(404);
-  const a = lc(me.username), b = lc(t.username);
-  const allowed = a === b || t.friends.includes(a) || t.incoming.includes(a) || t.outgoing.includes(a);
-  if (!allowed) return fail(404);
   const buf = Buffer.from(t.avatar, 'base64');
   res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=31536000, immutable' });
   res.end(buf);
