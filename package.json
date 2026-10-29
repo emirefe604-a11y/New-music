@@ -1,9 +1,0 @@
-{
-  "name": "sounddeep-auth",
-  "version": "1.0.0",
-  "description": "Sounddeep e-posta doğrulama kodu sunucusu",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "nodemailer": "^6.9.14" }
-}
