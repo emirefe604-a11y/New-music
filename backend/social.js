@@ -2,7 +2,8 @@
 // Tüm uç noktalar POST'tur. /social/join dışındakiler "Authorization: Bearer <token>" ister.
 //
 //  /social/join            { username }                    -> { token, username }
-//  /social/heartbeat       {}                              -> { ok }       (uygulama açıkken ~30 sn'de bir)
+//  /social/heartbeat       { playing? }                    -> { ok }       (uygulama açıkken ~30 sn'de bir; playing = şu an çalan şarkı)
+//  /social/rename          { username }                    -> { ok, username }
 //  /social/offline         {}                              -> { ok }       (uygulama kapanırken)
 //  /social/friends         {}                              -> { friends, incoming, outgoing }
 //  /social/friend-request  { username }                    -> { ok }
@@ -28,7 +29,9 @@ const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
 // users: username(lowercase) -> { username, tokenHash, lastSeen, friends:[lc], incoming:[lc], outgoing:[lc], inbox:[...] }
 // lastSeen yalnızca bellekte tutulur (kaydedilmez): böylece her sinyal veritabanına yazı yapmaz.
 const users = {};
-const ser = (u) => JSON.stringify(u, (k, v) => (k === 'lastSeen' ? undefined : v));
+const MEMORY_ONLY = new Set(['lastSeen', 'playing', 'renamedAt']);   // bellekte kalır, veritabanına yazılmaz
+const ser = (u) => JSON.stringify(u, (k, v) => (MEMORY_ONLY.has(k) ? undefined : v));
+const removed = new Set();   // adı değişen kullanıcıların eski anahtarları
 
 async function redis(cmds) {
   const r = await fetch(REDIS_URL + '/pipeline', {
@@ -80,10 +83,13 @@ async function flush(retryMs) {
   timer = null;
   const names = [...dirty];
   dirty.clear();
-  if (names.length === 0) return;
+  const gone = [...removed].filter((n) => !users[n]);   // eski ad başkası tarafından alındıysa silme
+  removed.clear();
+  if (names.length === 0 && gone.length === 0) return;
   try {
     if (useRedis) {
       const cmds = [];
+      for (const n of gone) { cmds.push(['DEL', 'u:' + n]); cmds.push(['SREM', 'users', n]); }
       for (const n of names) if (users[n]) { cmds.push(['SET', 'u:' + n, ser(users[n])]); cmds.push(['SADD', 'users', n]); }
       if (cmds.length) await redis(cmds);
     } else {
@@ -92,6 +98,7 @@ async function flush(retryMs) {
   } catch (e) {
     console.error('Kayıt hatası:', e.message);
     names.forEach((n) => dirty.add(n));
+    gone.forEach((n) => removed.add(n));
     if (!timer) timer = setTimeout(flush, 10000);   // 10 sn sonra tekrar dene
   }
 }
@@ -114,7 +121,17 @@ function authUser(req) {
 }
 
 const isOnline = (u) => u.lastSeen > 0 && Date.now() - u.lastSeen < ONLINE_MS;
-const view = (u) => ({ username: u.username, online: isOnline(u), lastSeen: u.lastSeen || 0 });
+const view = (u) => {
+  const v = { username: u.username, online: isOnline(u), lastSeen: u.lastSeen || 0 };
+  if (v.online && u.playing) v.listening = u.playing;   // yalnızca çevrim içiyken gösterilir
+  return v;
+};
+
+function cleanPlaying(p) {
+  if (!p || typeof p !== 'object' || typeof p.title !== 'string' || !p.title) return null;
+  const url = typeof p.url === 'string' && !p.url.startsWith('local://') && p.url.length <= 300 ? p.url : '';
+  return { title: p.title.slice(0, 150), artist: String(p.artist || '').slice(0, 100), url, thumb: p.thumb ? String(p.thumb).slice(0, 300) : null };
+}
 const without = (arr, x) => arr.filter((v) => v !== x);
 
 function cleanSongs(songs) {
@@ -162,11 +179,13 @@ async function handle(req, res, path, body, ip, reply) {
   switch (path) {
     case '/social/heartbeat':
       me.lastSeen = Date.now();
+      me.playing = cleanPlaying(body.playing);   // gönderilmezse "dinlemiyor" sayılır
       reply(res, 200, { ok: true });
       return true;
 
     case '/social/offline':
       me.lastSeen = Date.now() - ONLINE_MS;   // çevrim dışı say ama son görülme zamanı kalsın
+      me.playing = null;
       reply(res, 200, { ok: true });
       return true;
 
@@ -243,6 +262,35 @@ async function handle(req, res, path, body, ip, reply) {
       }
       touch(...changed);
       reply(res, 200, { ok: true, sent });
+      return true;
+    }
+
+    case '/social/rename': {
+      const name = String(body.username || '').trim();
+      if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
+      if (Date.now() - (me.renamedAt || 0) < 60 * 1000) { reply(res, 429, { error: 'Adı çok sık değiştiremezsin. Biraz bekle.' }); return true; }
+      const oldKey = lc(me.username), newKey = lc(name);
+      if (newKey === oldKey) {            // yalnızca büyük/küçük harf değişti
+        me.username = name; me.renamedAt = Date.now(); touch(me);
+        reply(res, 200, { ok: true, username: name });
+        return true;
+      }
+      if (users[newKey]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }
+      delete users[oldKey];
+      users[newKey] = me;
+      removed.add(oldKey);
+      const others = new Set([...me.friends, ...me.incoming, ...me.outgoing]);
+      const changed = [];
+      for (const k of others) {            // arkadaşların listelerindeki eski adı yenisiyle değiştir
+        const o = users[k];
+        if (!o) continue;
+        for (const f of ['friends', 'incoming', 'outgoing']) o[f] = o[f].map((x) => (x === oldKey ? newKey : x));
+        changed.push(o);
+      }
+      me.username = name;
+      me.renamedAt = Date.now();
+      touch(me, ...changed);
+      reply(res, 200, { ok: true, username: name });
       return true;
     }
 
