@@ -101,6 +101,9 @@ function handleVerify(res, body) {
 http.createServer(async (req, res) => {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
   if (req.method === 'GET' && req.url === '/') return send(res, 200, { ok: true, service: 'newmusic-auth', social: true });
+  if (req.method === 'GET' && req.url.startsWith('/social/avatar/')) {
+    if (await social.handleGet(req, res, req.url.split('?')[0])) return;
+  }
   if (req.method !== 'POST') return send(res, 404, { error: 'Bulunamadı' });
   const isSocial = req.url.startsWith('/social/');
   if (!isSocial && limited(ip)) return send(res, 429, { error: 'Çok fazla istek. Biraz sonra tekrar dene.' });

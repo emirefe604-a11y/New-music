@@ -12,6 +12,8 @@
 //  /social/share           { to: [username], name, songs } -> { ok, sent }
 //  /social/inbox           {}                              -> { items }
 //  /social/inbox-dismiss   { id }                          -> { ok }
+//  /social/avatar          { image: base64 JPEG | null }   -> { ok, avatarV }   (profil resmi yükle / kaldır)
+//  GET /social/avatar/<kullanıcı>?v=<sürüm>                -> JPEG (yalnızca kendisi, arkadaşları ve istek atanlar görebilir)
 const crypto = require('crypto');
 const fs = require('fs');
 
@@ -21,7 +23,8 @@ const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const useRedis = Boolean(REDIS_URL && REDIS_TOKEN);
 
-const ONLINE_MS = 75 * 1000;      // son sinyalden bu yana 75 sn geçmediyse "çevrim içi"
+const ONLINE_MS = 100 * 1000;     // son sinyalden bu yana 100 sn geçmediyse "çevrim içi" (tek bir kaçan sinyal kullanıcıyı düşürmesin)
+const MAX_AVATAR = 60 * 1024;     // profil resmi (JPEG) en fazla 60 KB
 const MAX_SONGS = 100;
 const MAX_INBOX = 20;
 const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
@@ -122,7 +125,7 @@ function authUser(req) {
 
 const isOnline = (u) => u.lastSeen > 0 && Date.now() - u.lastSeen < ONLINE_MS;
 const view = (u) => {
-  const v = { username: u.username, online: isOnline(u), lastSeen: u.lastSeen || 0 };
+  const v = { username: u.username, online: isOnline(u), lastSeen: u.lastSeen || 0, avatarV: u.avatarV || 0 };
   if (v.online && u.playing) v.listening = u.playing;   // yalnızca çevrim içiyken gösterilir
   return v;
 };
@@ -190,12 +193,14 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
 
     case '/social/friends': {
-      me.lastSeen = Date.now();
+      // Not: burada lastSeen güncellenmez; çevrim içi bilgisi yalnızca /social/heartbeat ile gelir
+      // (arka planda listeyi yenilemek kullanıcıyı yanlışlıkla "çevrim içi" göstermesin).
       const list = (arr) => arr.map((n) => users[n]).filter(Boolean);
       reply(res, 200, {
         friends: list(me.friends).map(view),
-        incoming: list(me.incoming).map((u) => ({ username: u.username })),
-        outgoing: list(me.outgoing).map((u) => ({ username: u.username })),
+        incoming: list(me.incoming).map((u) => ({ username: u.username, avatarV: u.avatarV || 0 })),
+        outgoing: list(me.outgoing).map((u) => ({ username: u.username, avatarV: u.avatarV || 0 })),
+        me: { username: me.username, avatarV: me.avatarV || 0 },
         inbox: me.inbox.length
       });
       return true;
@@ -265,6 +270,25 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
     }
 
+    case '/social/avatar': {
+      if (body.image === null || body.image === '') {          // kaldır
+        delete me.avatar; me.avatarV = 0; touch(me);
+        reply(res, 200, { ok: true, avatarV: 0 });
+        return true;
+      }
+      if (typeof body.image !== 'string' || !/^[A-Za-z0-9+/=\s]+$/.test(body.image)) { reply(res, 400, { error: 'Geçersiz resim.' }); return true; }
+      if (Date.now() - (me.avatarAt || 0) < 3000) { reply(res, 429, { error: 'Çok sık değiştiriyorsun. Biraz bekle.' }); return true; }
+      const buf = Buffer.from(body.image, 'base64');
+      if (buf.length < 100 || buf.length > MAX_AVATAR) { reply(res, 413, { error: 'Resim çok büyük.' }); return true; }
+      if (!(buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)) { reply(res, 400, { error: 'Yalnızca JPEG resim kabul edilir.' }); return true; }
+      me.avatar = buf.toString('base64');
+      me.avatarV = Date.now();
+      me.avatarAt = Date.now();
+      touch(me);
+      reply(res, 200, { ok: true, avatarV: me.avatarV });
+      return true;
+    }
+
     case '/social/rename': {
       const name = String(body.username || '').trim();
       if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
@@ -310,4 +334,23 @@ async function handle(req, res, path, body, ip, reply) {
   }
 }
 
-module.exports = { handle };
+// GET /social/avatar/<kullanıcı>: profil resmini döndürür. Kendisi, arkadaşları ve bekleyen istek sahipleri görebilir.
+async function handleGet(req, res, path) {
+  const m = /^\/social\/avatar\/([a-zA-Z0-9_.]{3,20})$/.exec(path);
+  if (!m) return false;
+  const fail = (code) => { res.writeHead(code, { 'Content-Type': 'text/plain' }); res.end(); return true; };
+  if (!(await ensureLoaded())) return fail(503);
+  const me = authUser(req);
+  if (!me) return fail(401);
+  const t = users[lc(m[1])];
+  if (!t || !t.avatar) return fail(404);
+  const a = lc(me.username), b = lc(t.username);
+  const allowed = a === b || t.friends.includes(a) || t.incoming.includes(a) || t.outgoing.includes(a);
+  if (!allowed) return fail(404);
+  const buf = Buffer.from(t.avatar, 'base64');
+  res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=31536000, immutable' });
+  res.end(buf);
+  return true;
+}
+
+module.exports = { handle, handleGet };
