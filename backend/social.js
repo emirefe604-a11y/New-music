@@ -1,7 +1,17 @@
 // Sounddeep - sosyal özellikler: arkadaşlar, çevrim içi/dışı bilgisi, liste paylaşımı
 // Tüm uç noktalar POST'tur. /social/join dışındakiler "Authorization: Bearer <token>" ister.
 //
-//  /social/join            { username }                    -> { token, username }
+//  /social/join            { username, password, email, code }         -> { token, username }        (hesap oluştur)
+//  /social/login           { username, password }          -> { token, username, avatarV }  (uygulamayı silince/yeni telefonda giriş)
+//  /social/signup-code     { username, email }             -> { ok, skip? }   (hesap açarken e-postaya 6 haneli kod; skip: sunucuda e-posta kapalı)
+//  /social/reset-code      { username }                    -> { ok, email }   (şifremi unuttum: hesaba bağlı e-postaya kod; email maskeli)
+//  /social/reset           { username, code, password }    -> { ok }          (kodla yeni şifre; tüm oturumlar kapanır)
+//  /social/email-code      { email }                       -> { ok }          (hesaba e-posta bağla: kod gönder)
+//  /social/email-set       { email, code }                 -> { ok, email }   (kodu doğrula ve e-postayı bağla)
+//  /social/logout          {}                              -> { ok }
+//  /social/password        { old?, password }              -> { ok }       (şifre belirle / değiştir; eski hesaplar ilk kez şifre koyar)
+//  /social/data-get        {}                              -> { data, rev }   (listeler, beğeniler vb. yedeği; istemci sıkıştırır)
+//  /social/data-put        { data }                        -> { ok, rev }
 //  /social/heartbeat       { playing? }                    -> { ok }       (uygulama açıkken ~30 sn'de bir; playing = şu an çalan şarkı)
 //  /social/rename          { username }                    -> { ok, username }
 //  /social/offline         {}                              -> { ok }       (uygulama kapanırken)
@@ -13,10 +23,13 @@
 //  /social/inbox           {}                              -> { items }
 //  /social/inbox-dismiss   { id }                          -> { ok }
 //  /social/search          { q }                           -> { users: [{ username, avatarV, relation }] }   (relation: none|friend|outgoing|incoming)
+//  /social/taste           { artists: [..] }               -> { ok }       (en çok dinlenen sanatçılar; Blend için)
+//  /social/blend           { username }                    -> { artists }  (yalnızca arkadaşın sanatçıları)
 //  /social/avatar          { image: base64 JPEG | null }   -> { ok, avatarV }   (profil resmi yükle / kaldır)
 //  GET /social/avatar/<kullanıcı>?v=<sürüm>                -> JPEG (giriş yapmış kullanıcılar görebilir)
 const crypto = require('crypto');
 const fs = require('fs');
+const mail = require('./mail');
 
 const DATA_FILE = process.env.DATA_FILE || './social-data.json';
 // Kalıcı depolama (ücretsiz): Upstash Redis. İki değişken de doluysa kullanılır, yoksa dosyaya yazılır.
@@ -70,10 +83,12 @@ async function loadAll() {
   }
 }
 
+function indexAll() { for (const u of Object.values(users)) indexTokens(u); }
+
 let loaded = false, loadPromise = null;
 async function ensureLoaded() {
   if (loaded) return true;
-  try { await (loadPromise = loadPromise || loadAll()); loaded = true; return true; }
+  try { await (loadPromise = loadPromise || loadAll()); indexAll(); loaded = true; return true; }
   catch (e) { loadPromise = null; console.error('Veri yüklenemedi:', e.message); return false; }
 }
 
@@ -111,17 +126,103 @@ const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const lc = (s) => String(s || '').trim().toLowerCase();
 const validName = (s) => /^[a-zA-Z0-9_.]{3,20}$/.test(s);
 const joinHits = new Map();
+const loginHits = new Map();     // ip -> { count, reset }
+const loginFails = new Map();    // kullanıcı -> { count, reset }  (şifre deneme koruması)
+const MAX_TOKENS = 5;            // bir hesapta en fazla 5 cihaz oturumu
+const MAX_DATA = 700 * 1000;     // yedek verisi (gzip + base64) en fazla ~700 KB
+const tokenIndex = new Map();    // tokenHash -> kullanıcı
 
-function authUser(req) {
-  const h = String(req.headers['authorization'] || '');
-  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
-  if (!token) return null;
-  const th = sha(token);
-  for (const u of Object.values(users)) {
-    const a = Buffer.from(u.tokenHash), b = Buffer.from(th);
-    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return u;
-  }
+// ---- e-posta kodları (bellekte, hash'li): 10 dk geçerli, 5 yanlış denemede iptal ----
+const CODE_TTL = 10 * 60 * 1000, CODE_RESEND = 30 * 1000, CODE_ATTEMPTS = 5;
+const codes = new Map();         // 'amaç:anahtar' -> { hash, expires, attempts, sentAt }
+const codeHits = new Map();      // ip -> { count, reset }
+const isEmail = (s) => typeof s === 'string' && s.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+const normEmail = (s) => String(s || '').trim().toLowerCase();
+const maskEmail = (e) => { const [a, d] = String(e).split('@'); return a.slice(0, 1) + '***@' + d; };
+const emailTaken = (email, exceptKey) => Object.entries(users).some(([k, u]) => k !== exceptKey && u.email === email);
+
+/** Kod üretip e-posta ile gönderir. Hata mesajı döner, başarılıysa null. */
+async function issueCode(key, email, purpose) {
+  const old = codes.get(key);
+  if (old && Date.now() - old.sentAt < CODE_RESEND) return 'Yeni kod istemeden önce biraz bekle.';
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  try { await mail.sendCode(email, code, purpose); }
+  catch (e) { console.error('Mail gönderilemedi:', e.message); return 'E-posta gönderilemedi. Daha sonra tekrar dene.'; }
+  codes.set(key, { hash: sha(code), expires: Date.now() + CODE_TTL, attempts: 0, sentAt: Date.now() });
   return null;
+}
+/** Kodu doğrular. Hata mesajı döner, doğruysa null (kod tek kullanımlık). */
+function checkCode(key, code) {
+  const e = codes.get(key);
+  if (!e || e.expires < Date.now()) return 'Kodun süresi dolmuş. Yeni kod iste.';
+  if (e.attempts >= CODE_ATTEMPTS) { codes.delete(key); return 'Çok fazla yanlış deneme. Yeni kod iste.'; }
+  e.attempts += 1;
+  const a = Buffer.from(sha(String(code || '').trim())), b = Buffer.from(e.hash);
+  if (a.length === b.length && crypto.timingSafeEqual(a, b)) { codes.delete(key); return null; }
+  return 'Kod yanlış. Tekrar dene.';
+}
+
+const scrypt = (pw, salt) => new Promise((res, rej) => crypto.scrypt(pw, salt, 32, { N: 16384 }, (e, k) => (e ? rej(e) : res(k))));
+async function hashPw(pw) {
+  const salt = crypto.randomBytes(16);
+  return { s: salt.toString('hex'), h: (await scrypt(pw, salt)).toString('hex') };
+}
+async function checkPw(pw, rec) {
+  if (!rec || !rec.s || !rec.h) return false;
+  const h = await scrypt(pw, Buffer.from(rec.s, 'hex'));
+  const want = Buffer.from(rec.h, 'hex');
+  return h.length === want.length && crypto.timingSafeEqual(h, want);
+}
+const validPw = (s) => typeof s === 'string' && s.length >= 4 && s.length <= 64;
+
+function indexTokens(u) {
+  if (!Array.isArray(u.tokens)) u.tokens = u.tokenHash ? [u.tokenHash] : [];   // eski kayıtları taşı
+  delete u.tokenHash;
+  u.tokens.forEach((t) => tokenIndex.set(t, u));
+}
+function addToken(u, token) {
+  indexTokens(u);
+  u.tokens.push(sha(token));
+  while (u.tokens.length > MAX_TOKENS) tokenIndex.delete(u.tokens.shift());
+  tokenIndex.set(sha(token), u);
+}
+function hit(map, key, limit, windowMs) {
+  const now = Date.now();
+  let h = map.get(key);
+  if (!h || h.reset < now) { h = { count: 0, reset: now + windowMs }; map.set(key, h); }
+  return ++h.count > limit;
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const m of [joinHits, loginHits, loginFails, codeHits]) for (const [k, v] of m) if (v.reset < now) m.delete(k);
+  for (const [k, v] of codes) if (v.expires < now) codes.delete(k);
+}, 60 * 1000).unref();
+
+// Yedek verisi: Redis'te ayrı anahtar (u.id), dosya modunda kullanıcı kaydının içinde
+async function readData(u) {
+  if (useRedis) {
+    if (!u.id) return { data: null, rev: 0 };
+    const [r] = await redis([['GET', 'd:' + u.id]]);
+    return r.result ? JSON.parse(r.result) : { data: null, rev: 0 };
+  }
+  return { data: u.data || null, rev: u.dataRev || 0 };
+}
+async function writeData(u, data) {
+  const rev = Date.now();
+  if (useRedis) {
+    if (!u.id) { u.id = crypto.randomBytes(8).toString('hex'); touch(u); }
+    await redis([['SET', 'd:' + u.id, JSON.stringify({ data, rev })]]);
+  } else { u.data = data; u.dataRev = rev; touch(u); }
+  return rev;
+}
+
+function tokenOf(req) {
+  const h = String(req.headers['authorization'] || '');
+  return h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+}
+function authUser(req) {
+  const token = tokenOf(req);
+  return token ? tokenIndex.get(sha(token)) || null : null;
 }
 
 const isOnline = (u) => u.lastSeen > 0 && Date.now() - u.lastSeen < ONLINE_MS;
@@ -163,17 +264,88 @@ async function handle(req, res, path, body, ip, reply) {
   if (!(await ensureLoaded())) { reply(res, 503, { error: 'Sunucu veritabanına ulaşamıyor. Biraz sonra tekrar dene.' }); return true; }
 
   if (path === '/social/join') {
-    const now = Date.now();
-    let h = joinHits.get(ip);
-    if (!h || h.reset < now) { h = { count: 0, reset: now + 10 * 60 * 1000 }; joinHits.set(ip, h); }
-    if (++h.count > JOIN_LIMIT) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+    if (hit(joinHits, ip, JOIN_LIMIT, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
     const name = String(body.username || '').trim();
     if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
+    if (!validPw(body.password)) { reply(res, 400, { error: 'Şifre en az 4 karakter olmalı.' }); return true; }
     if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }
+    let email = '';
+    if (mail.enabled) {   // e-posta doğrulaması zorunlu: şifre unutulursa hesap kurtarılabilsin
+      email = normEmail(body.email);
+      if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
+      if (emailTaken(email)) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
+      const bad = checkCode('signup:' + email, body.code);
+      if (bad) { reply(res, 400, { error: bad }); return true; }
+    }
     const token = crypto.randomBytes(24).toString('hex');
-    users[lc(name)] = { username: name, tokenHash: sha(token), lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [] };
-    touch(users[lc(name)]);
+    const u = { username: name, id: crypto.randomBytes(8).toString('hex'), pw: await hashPw(body.password), email: email || undefined, tokens: [], lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [] };
+    if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }   // hash beklenirken alındıysa
+    users[lc(name)] = u;
+    addToken(u, token);
+    touch(u);
     reply(res, 200, { token, username: name });
+    return true;
+  }
+
+  if (path === '/social/signup-code') {
+    if (hit(codeHits, ip, 10, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+    const name = String(body.username || '').trim();
+    const email = normEmail(body.email);
+    if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
+    if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }
+    if (!mail.enabled) { reply(res, 200, { ok: true, skip: true }); return true; }   // sunucuda e-posta kapalı: kodsuz açılır
+    if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
+    if (emailTaken(email)) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
+    const err = await issueCode('signup:' + email, email, 'signup');
+    if (err) { reply(res, 429, { error: err }); return true; }
+    reply(res, 200, { ok: true });
+    return true;
+  }
+
+  if (path === '/social/reset-code') {
+    if (hit(codeHits, ip, 10, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+    if (!mail.enabled) { reply(res, 503, { error: 'Bu sunucuda e-posta ayarlı değil, şifre sıfırlanamıyor.' }); return true; }
+    const key = lc(body.username);
+    const u = users[key];
+    if (!u) { reply(res, 404, { error: 'Böyle bir kullanıcı yok.' }); return true; }
+    if (!u.email) { reply(res, 400, { error: 'Bu hesaba e-posta bağlı değil, şifre sıfırlanamıyor.' }); return true; }
+    const err = await issueCode('reset:' + key, u.email, 'reset');
+    if (err) { reply(res, 429, { error: err }); return true; }
+    reply(res, 200, { ok: true, email: maskEmail(u.email) });
+    return true;
+  }
+
+  if (path === '/social/reset') {
+    if (hit(codeHits, ip, 20, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+    const key = lc(body.username);
+    const u = users[key];
+    if (!validPw(body.password)) { reply(res, 400, { error: 'Şifre en az 4 karakter olmalı.' }); return true; }
+    if (!u || !u.email) { reply(res, 404, { error: 'Böyle bir hesap yok.' }); return true; }
+    const bad = checkCode('reset:' + key, body.code);
+    if (bad) { reply(res, 400, { error: bad }); return true; }
+    u.pw = await hashPw(body.password);
+    indexTokens(u);
+    u.tokens.forEach((t) => tokenIndex.delete(t));   // şifre sıfırlanınca tüm cihazların oturumu kapanır
+    u.tokens = [];
+    loginFails.delete(key);
+    touch(u);
+    reply(res, 200, { ok: true });
+    return true;
+  }
+
+  if (path === '/social/login') {
+    if (hit(loginHits, ip, 20, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+    const key = lc(body.username);
+    const u = users[key];
+    if (hit(loginFails, key, 8, 15 * 60 * 1000) && loginFails.get(key).count > 8) { reply(res, 429, { error: 'Bu hesap için çok fazla yanlış deneme. 15 dakika sonra tekrar dene.' }); return true; }
+    if (!u || typeof body.password !== 'string' || !(await checkPw(body.password, u.pw))) {
+      reply(res, 403, { error: 'Kullanıcı adı veya şifre yanlış.' }); return true;
+    }
+    loginFails.delete(key);
+    const token = crypto.randomBytes(24).toString('hex');
+    addToken(u, token);
+    touch(u);
+    reply(res, 200, { token, username: u.username, avatarV: u.avatarV || 0 });
     return true;
   }
 
@@ -181,6 +353,68 @@ async function handle(req, res, path, body, ip, reply) {
   if (!me) { reply(res, 401, { error: 'Oturum geçersiz. Sosyal hesabını yeniden oluştur.' }); return true; }
 
   switch (path) {
+    case '/social/logout': {
+      const h = sha(tokenOf(req));
+      indexTokens(me);
+      me.tokens = me.tokens.filter((t) => t !== h);
+      tokenIndex.delete(h);
+      me.lastSeen = Date.now() - ONLINE_MS; me.playing = null;
+      touch(me);
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
+    case '/social/email-code': {
+      if (hit(codeHits, ip, 10, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+      if (!mail.enabled) { reply(res, 503, { error: 'Bu sunucuda e-posta ayarlı değil.' }); return true; }
+      const email = normEmail(body.email);
+      if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
+      if (emailTaken(email, lc(me.username))) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
+      const err = await issueCode('link:' + lc(me.username) + ':' + email, email, 'link');
+      if (err) { reply(res, 429, { error: err }); return true; }
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
+    case '/social/email-set': {
+      const email = normEmail(body.email);
+      if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
+      if (emailTaken(email, lc(me.username))) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
+      const bad = checkCode('link:' + lc(me.username) + ':' + email, body.code);
+      if (bad) { reply(res, 400, { error: bad }); return true; }
+      me.email = email;
+      touch(me);
+      reply(res, 200, { ok: true, email: maskEmail(email) });
+      return true;
+    }
+
+    case '/social/password': {
+      if (!validPw(body.password)) { reply(res, 400, { error: 'Şifre en az 4 karakter olmalı.' }); return true; }
+      if (me.pw) {   // eski şifre gerekir (şifresi olmayan eski hesaplar ilk kez serbestçe koyar)
+        const k = 'pw:' + lc(me.username);
+        if (hit(loginFails, k, 8, 15 * 60 * 1000) && loginFails.get(k).count > 8) { reply(res, 429, { error: 'Çok fazla yanlış deneme. Biraz bekle.' }); return true; }
+        if (typeof body.old !== 'string' || !(await checkPw(body.old, me.pw))) { reply(res, 403, { error: 'Mevcut şifre yanlış.' }); return true; }
+        loginFails.delete(k);
+      }
+      me.pw = await hashPw(body.password);
+      touch(me);
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
+    case '/social/data-get': {
+      try { reply(res, 200, await readData(me)); }
+      catch (e) { reply(res, 503, { error: 'Yedek okunamadı.' }); }
+      return true;
+    }
+
+    case '/social/data-put': {
+      if (typeof body.data !== 'string' || body.data.length > MAX_DATA) { reply(res, 413, { error: 'Yedek çok büyük.' }); return true; }
+      try { reply(res, 200, { ok: true, rev: await writeData(me, body.data) }); }
+      catch (e) { console.error('Yedek yazılamadı:', e.message); reply(res, 503, { error: 'Yedek kaydedilemedi.' }); }
+      return true;
+    }
+
     case '/social/heartbeat':
       me.lastSeen = Date.now();
       me.playing = cleanPlaying(body.playing);   // gönderilmezse "dinlemiyor" sayılır
@@ -201,7 +435,7 @@ async function handle(req, res, path, body, ip, reply) {
         friends: list(me.friends).map(view),
         incoming: list(me.incoming).map((u) => ({ username: u.username, avatarV: u.avatarV || 0 })),
         outgoing: list(me.outgoing).map((u) => ({ username: u.username, avatarV: u.avatarV || 0 })),
-        me: { username: me.username, avatarV: me.avatarV || 0 },
+        me: { username: me.username, avatarV: me.avatarV || 0, hasPassword: Boolean(me.pw), email: me.email ? maskEmail(me.email) : null },
         inbox: me.inbox.length
       });
       return true;
@@ -268,6 +502,21 @@ async function handle(req, res, path, body, ip, reply) {
       }
       touch(...changed);
       reply(res, 200, { ok: true, sent });
+      return true;
+    }
+
+    case '/social/taste': {
+      const arr = Array.isArray(body.artists) ? body.artists : [];
+      me.taste = arr.map((x) => String(x || '').trim().slice(0, 60)).filter(Boolean).slice(0, 12);
+      touch(me);
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
+    case '/social/blend': {
+      const t = users[lc(body.username)];
+      if (!t || !me.friends.includes(lc(t.username))) { reply(res, 404, { error: 'Bu kişi arkadaş listende yok.' }); return true; }
+      reply(res, 200, { artists: Array.isArray(t.taste) ? t.taste : [] });
       return true;
     }
 

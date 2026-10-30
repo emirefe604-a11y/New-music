@@ -1,9 +1,16 @@
 {
   "name": "sounddeep-auth",
   "version": "1.0.0",
-  "description": "Sounddeep e-posta doğrulama kodu sunucusu",
+  "description": "Sounddeep sunucusu: hesap, e-posta ile şifre sıfırlama, arkadaşlar, yedek, Blend",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "nodemailer": "^6.9.14" }
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "optionalDependencies": {
+    "nodemailer": "^6.9.14"
+  }
 }
