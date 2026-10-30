@@ -1,18 +1,11 @@
 // Sounddeep - sosyal özellikler: arkadaşlar, çevrim içi/dışı bilgisi, liste paylaşımı
 // Tüm uç noktalar POST'tur. /social/join dışındakiler "Authorization: Bearer <token>" ister.
 //
-//  /social/join            { username, password, email, code }         -> { token, username }        (hesap oluştur)
-//  /social/login           { username, password }          -> { token, username, avatarV }  (uygulamayı silince/yeni telefonda giriş)
-//  /social/signup-code     { username, email }             -> { ok, skip? }   (hesap açarken e-postaya 6 haneli kod; skip: sunucuda e-posta kapalı)
-//  /social/reset-code      { username }                    -> { ok, email }   (şifremi unuttum: hesaba bağlı e-postaya kod; email maskeli)
-//  /social/reset           { username, code, password }    -> { ok }          (kodla yeni şifre; tüm oturumlar kapanır)
-//  /social/email-code      { email }                       -> { ok }          (hesaba e-posta bağla: kod gönder)
-//  /social/email-set       { email, code }                 -> { ok, email }   (kodu doğrula ve e-postayı bağla)
-//  /social/logout          {}                              -> { ok }
-//  /social/password        { old?, password }              -> { ok }       (şifre belirle / değiştir; eski hesaplar ilk kez şifre koyar)
-//  /social/data-get        {}                              -> { data, rev }   (listeler, beğeniler vb. yedeği; istemci sıkıştırır)
-//  /social/data-put        { data }                        -> { ok, rev }
+//  /social/join            { username }                    -> { token, username }
 //  /social/heartbeat       { playing? }                    -> { ok }       (uygulama açıkken ~30 sn'de bir; playing = şu an çalan şarkı)
+//  /social/avatar-set      { image: base64 JPEG }          -> { ok, avatar }
+//  /social/avatar-clear    {}                              -> { ok }
+//  GET /social/avatar/<id>                                 -> JPEG (id tahmin edilemez, arkadaşın listesinde görünür)
 //  /social/rename          { username }                    -> { ok, username }
 //  /social/offline         {}                              -> { ok }       (uygulama kapanırken)
 //  /social/friends         {}                              -> { friends, incoming, outgoing }
@@ -22,14 +15,9 @@
 //  /social/share           { to: [username], name, songs } -> { ok, sent }
 //  /social/inbox           {}                              -> { items }
 //  /social/inbox-dismiss   { id }                          -> { ok }
-//  /social/search          { q }                           -> { users: [{ username, avatarV, relation }] }   (relation: none|friend|outgoing|incoming)
-//  /social/taste           { artists: [..] }               -> { ok }       (en çok dinlenen sanatçılar; Blend için)
-//  /social/blend           { username }                    -> { artists }  (yalnızca arkadaşın sanatçıları)
-//  /social/avatar          { image: base64 JPEG | null }   -> { ok, avatarV }   (profil resmi yükle / kaldır)
-//  GET /social/avatar/<kullanıcı>?v=<sürüm>                -> JPEG (giriş yapmış kullanıcılar görebilir)
 const crypto = require('crypto');
 const fs = require('fs');
-const mail = require('./mail');
+const path = require('path');
 
 const DATA_FILE = process.env.DATA_FILE || './social-data.json';
 // Kalıcı depolama (ücretsiz): Upstash Redis. İki değişken de doluysa kullanılır, yoksa dosyaya yazılır.
@@ -37,8 +25,9 @@ const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const useRedis = Boolean(REDIS_URL && REDIS_TOKEN);
 
-const ONLINE_MS = 100 * 1000;     // son sinyalden bu yana 100 sn geçmediyse "çevrim içi" (tek bir kaçan sinyal kullanıcıyı düşürmesin)
-const MAX_AVATAR = 60 * 1024;     // profil resmi (JPEG) en fazla 60 KB
+const ONLINE_MS = 50 * 1000;      // son sinyalden bu yana 50 sn geçmediyse "çevrim içi" (uygulama 5-15 sn'de bir sinyal yollar)
+const AVATAR_DIR = process.env.AVATAR_DIR || './social-avatars';
+const AVATAR_MAX = 64 * 1024;     // profil fotoğrafı en fazla 64 KB (uygulama 256x256 JPEG yollar)
 const MAX_SONGS = 100;
 const MAX_INBOX = 20;
 const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
@@ -46,7 +35,7 @@ const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
 // users: username(lowercase) -> { username, tokenHash, lastSeen, friends:[lc], incoming:[lc], outgoing:[lc], inbox:[...] }
 // lastSeen yalnızca bellekte tutulur (kaydedilmez): böylece her sinyal veritabanına yazı yapmaz.
 const users = {};
-const MEMORY_ONLY = new Set(['lastSeen', 'playing', 'renamedAt']);   // bellekte kalır, veritabanına yazılmaz
+const MEMORY_ONLY = new Set(['lastSeen', 'playing', 'renamedAt', 'avatarAt']);   // bellekte kalır, veritabanına yazılmaz
 const ser = (u) => JSON.stringify(u, (k, v) => (MEMORY_ONLY.has(k) ? undefined : v));
 const removed = new Set();   // adı değişen kullanıcıların eski anahtarları
 
@@ -83,13 +72,53 @@ async function loadAll() {
   }
 }
 
-function indexAll() { for (const u of Object.values(users)) indexTokens(u); }
-
 let loaded = false, loadPromise = null;
 async function ensureLoaded() {
   if (loaded) return true;
-  try { await (loadPromise = loadPromise || loadAll()); indexAll(); loaded = true; return true; }
+  try { await (loadPromise = loadPromise || loadAll()); loaded = true; return true; }
   catch (e) { loadPromise = null; console.error('Veri yüklenemedi:', e.message); return false; }
+}
+
+// ---- Profil fotoğrafları: Redis'te "a:<id>" (base64), Redis yoksa dosyada ----
+const avatarCache = new Map();
+function cachePut(id, buf) {
+  avatarCache.set(id, buf);
+  if (avatarCache.size > 200) avatarCache.delete(avatarCache.keys().next().value);
+}
+async function blobGet(id) {
+  if (useRedis) {
+    const [r] = await redis([['GET', 'a:' + id]]);
+    return r.result ? Buffer.from(r.result, 'base64') : null;
+  }
+  try { return await fs.promises.readFile(path.join(AVATAR_DIR, id + '.jpg')); } catch (e) { return null; }
+}
+async function blobSet(id, buf) {
+  if (useRedis) { await redis([['SET', 'a:' + id, buf.toString('base64')]]); return; }
+  await fs.promises.mkdir(AVATAR_DIR, { recursive: true });
+  await fs.promises.writeFile(path.join(AVATAR_DIR, id + '.jpg'), buf);
+}
+async function blobDel(id) {
+  if (useRedis) { await redis([['DEL', 'a:' + id]]); return; }
+  try { await fs.promises.unlink(path.join(AVATAR_DIR, id + '.jpg')); } catch (e) { /* yok */ }
+}
+
+async function serveAvatar(req, res) {
+  const id = req.url.split('?')[0].slice('/social/avatar/'.length);
+  const notFound = () => { res.writeHead(404); res.end(); };
+  if (!/^[a-f0-9]{16}$/.test(id)) return notFound();
+  let buf = avatarCache.get(id);
+  if (!buf) {
+    try { buf = await blobGet(id); } catch (e) { res.writeHead(503); return res.end(); }
+    if (!buf) return notFound();
+    cachePut(id, buf);
+  }
+  res.writeHead(200, {
+    'Content-Type': 'image/jpeg',
+    'Cache-Control': 'public, max-age=31536000, immutable',   // id her yüklemede değişir
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'"
+  });
+  res.end(buf);
 }
 
 const dirty = new Set();
@@ -126,111 +155,36 @@ const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const lc = (s) => String(s || '').trim().toLowerCase();
 const validName = (s) => /^[a-zA-Z0-9_.]{3,20}$/.test(s);
 const joinHits = new Map();
-const loginHits = new Map();     // ip -> { count, reset }
-const loginFails = new Map();    // kullanıcı -> { count, reset }  (şifre deneme koruması)
-const MAX_TOKENS = 5;            // bir hesapta en fazla 5 cihaz oturumu
-const MAX_DATA = 700 * 1000;     // yedek verisi (gzip + base64) en fazla ~700 KB
-const tokenIndex = new Map();    // tokenHash -> kullanıcı
 
-// ---- e-posta kodları (bellekte, hash'li): 10 dk geçerli, 5 yanlış denemede iptal ----
-const CODE_TTL = 10 * 60 * 1000, CODE_RESEND = 30 * 1000, CODE_ATTEMPTS = 5;
-const codes = new Map();         // 'amaç:anahtar' -> { hash, expires, attempts, sentAt }
-const codeHits = new Map();      // ip -> { count, reset }
-const isEmail = (s) => typeof s === 'string' && s.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
-const normEmail = (s) => String(s || '').trim().toLowerCase();
-const maskEmail = (e) => { const [a, d] = String(e).split('@'); return a.slice(0, 1) + '***@' + d; };
-const emailTaken = (email, exceptKey) => Object.entries(users).some(([k, u]) => k !== exceptKey && u.email === email);
-
-/** Kod üretip e-posta ile gönderir. Hata mesajı döner, başarılıysa null. */
-async function issueCode(key, email, purpose) {
-  const old = codes.get(key);
-  if (old && Date.now() - old.sentAt < CODE_RESEND) return 'Yeni kod istemeden önce biraz bekle.';
-  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-  try { await mail.sendCode(email, code, purpose); }
-  catch (e) { console.error('Mail gönderilemedi:', e.message); return 'E-posta gönderilemedi. Daha sonra tekrar dene.'; }
-  codes.set(key, { hash: sha(code), expires: Date.now() + CODE_TTL, attempts: 0, sentAt: Date.now() });
-  return null;
-}
-/** Kodu doğrular. Hata mesajı döner, doğruysa null (kod tek kullanımlık). */
-function checkCode(key, code) {
-  const e = codes.get(key);
-  if (!e || e.expires < Date.now()) return 'Kodun süresi dolmuş. Yeni kod iste.';
-  if (e.attempts >= CODE_ATTEMPTS) { codes.delete(key); return 'Çok fazla yanlış deneme. Yeni kod iste.'; }
-  e.attempts += 1;
-  const a = Buffer.from(sha(String(code || '').trim())), b = Buffer.from(e.hash);
-  if (a.length === b.length && crypto.timingSafeEqual(a, b)) { codes.delete(key); return null; }
-  return 'Kod yanlış. Tekrar dene.';
-}
-
-const scrypt = (pw, salt) => new Promise((res, rej) => crypto.scrypt(pw, salt, 32, { N: 16384 }, (e, k) => (e ? rej(e) : res(k))));
-async function hashPw(pw) {
-  const salt = crypto.randomBytes(16);
-  return { s: salt.toString('hex'), h: (await scrypt(pw, salt)).toString('hex') };
-}
-async function checkPw(pw, rec) {
-  if (!rec || !rec.s || !rec.h) return false;
-  const h = await scrypt(pw, Buffer.from(rec.s, 'hex'));
-  const want = Buffer.from(rec.h, 'hex');
-  return h.length === want.length && crypto.timingSafeEqual(h, want);
-}
-const validPw = (s) => typeof s === 'string' && s.length >= 4 && s.length <= 64;
-
-function indexTokens(u) {
-  if (!Array.isArray(u.tokens)) u.tokens = u.tokenHash ? [u.tokenHash] : [];   // eski kayıtları taşı
-  delete u.tokenHash;
-  u.tokens.forEach((t) => tokenIndex.set(t, u));
-}
-function addToken(u, token) {
-  indexTokens(u);
-  u.tokens.push(sha(token));
-  while (u.tokens.length > MAX_TOKENS) tokenIndex.delete(u.tokens.shift());
-  tokenIndex.set(sha(token), u);
-}
-function hit(map, key, limit, windowMs) {
-  const now = Date.now();
-  let h = map.get(key);
-  if (!h || h.reset < now) { h = { count: 0, reset: now + windowMs }; map.set(key, h); }
-  return ++h.count > limit;
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const m of [joinHits, loginHits, loginFails, codeHits]) for (const [k, v] of m) if (v.reset < now) m.delete(k);
-  for (const [k, v] of codes) if (v.expires < now) codes.delete(k);
-}, 60 * 1000).unref();
-
-// Yedek verisi: Redis'te ayrı anahtar (u.id), dosya modunda kullanıcı kaydının içinde
-async function readData(u) {
-  if (useRedis) {
-    if (!u.id) return { data: null, rev: 0 };
-    const [r] = await redis([['GET', 'd:' + u.id]]);
-    return r.result ? JSON.parse(r.result) : { data: null, rev: 0 };
-  }
-  return { data: u.data || null, rev: u.dataRev || 0 };
-}
-async function writeData(u, data) {
-  const rev = Date.now();
-  if (useRedis) {
-    if (!u.id) { u.id = crypto.randomBytes(8).toString('hex'); touch(u); }
-    await redis([['SET', 'd:' + u.id, JSON.stringify({ data, rev })]]);
-  } else { u.data = data; u.dataRev = rev; touch(u); }
-  return rev;
-}
-
-function tokenOf(req) {
-  const h = String(req.headers['authorization'] || '');
-  return h.startsWith('Bearer ') ? h.slice(7).trim() : '';
-}
 function authUser(req) {
-  const token = tokenOf(req);
-  return token ? tokenIndex.get(sha(token)) || null : null;
+  const h = String(req.headers['authorization'] || '');
+  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+  if (!token) return null;
+  const th = sha(token);
+  for (const u of Object.values(users)) {
+    const a = Buffer.from(u.tokenHash), b = Buffer.from(th);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return u;
+  }
+  return null;
 }
 
 const isOnline = (u) => u.lastSeen > 0 && Date.now() - u.lastSeen < ONLINE_MS;
 const view = (u) => {
-  const v = { username: u.username, online: isOnline(u), lastSeen: u.lastSeen || 0, avatarV: u.avatarV || 0 };
+  const v = { username: u.username, online: isOnline(u), lastSeen: u.lastSeen || 0, avatar: u.avatar || null };
   if (v.online && u.playing) v.listening = u.playing;   // yalnızca çevrim içiyken gösterilir
   return v;
 };
+
+function snapshot(me) {
+  const list = (arr) => arr.map((n) => users[n]).filter(Boolean);
+  return {
+    me: { username: me.username, avatar: me.avatar || null },
+    friends: list(me.friends).map(view),
+    incoming: list(me.incoming).map((u) => ({ username: u.username, avatar: u.avatar || null })),
+    outgoing: list(me.outgoing).map((u) => ({ username: u.username, avatar: u.avatar || null })),
+    inbox: me.inbox.length
+  };
+}
 
 function cleanPlaying(p) {
   if (!p || typeof p !== 'object' || typeof p.title !== 'string' || !p.title) return null;
@@ -264,88 +218,17 @@ async function handle(req, res, path, body, ip, reply) {
   if (!(await ensureLoaded())) { reply(res, 503, { error: 'Sunucu veritabanına ulaşamıyor. Biraz sonra tekrar dene.' }); return true; }
 
   if (path === '/social/join') {
-    if (hit(joinHits, ip, JOIN_LIMIT, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+    const now = Date.now();
+    let h = joinHits.get(ip);
+    if (!h || h.reset < now) { h = { count: 0, reset: now + 10 * 60 * 1000 }; joinHits.set(ip, h); }
+    if (++h.count > JOIN_LIMIT) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
     const name = String(body.username || '').trim();
     if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
-    if (!validPw(body.password)) { reply(res, 400, { error: 'Şifre en az 4 karakter olmalı.' }); return true; }
     if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }
-    let email = '';
-    if (mail.enabled) {   // e-posta doğrulaması zorunlu: şifre unutulursa hesap kurtarılabilsin
-      email = normEmail(body.email);
-      if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
-      if (emailTaken(email)) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
-      const bad = checkCode('signup:' + email, body.code);
-      if (bad) { reply(res, 400, { error: bad }); return true; }
-    }
     const token = crypto.randomBytes(24).toString('hex');
-    const u = { username: name, id: crypto.randomBytes(8).toString('hex'), pw: await hashPw(body.password), email: email || undefined, tokens: [], lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [] };
-    if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }   // hash beklenirken alındıysa
-    users[lc(name)] = u;
-    addToken(u, token);
-    touch(u);
+    users[lc(name)] = { username: name, tokenHash: sha(token), lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [] };
+    touch(users[lc(name)]);
     reply(res, 200, { token, username: name });
-    return true;
-  }
-
-  if (path === '/social/signup-code') {
-    if (hit(codeHits, ip, 10, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
-    const name = String(body.username || '').trim();
-    const email = normEmail(body.email);
-    if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
-    if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }
-    if (!mail.enabled) { reply(res, 200, { ok: true, skip: true }); return true; }   // sunucuda e-posta kapalı: kodsuz açılır
-    if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
-    if (emailTaken(email)) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
-    const err = await issueCode('signup:' + email, email, 'signup');
-    if (err) { reply(res, 429, { error: err }); return true; }
-    reply(res, 200, { ok: true });
-    return true;
-  }
-
-  if (path === '/social/reset-code') {
-    if (hit(codeHits, ip, 10, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
-    if (!mail.enabled) { reply(res, 503, { error: 'Bu sunucuda e-posta ayarlı değil, şifre sıfırlanamıyor.' }); return true; }
-    const key = lc(body.username);
-    const u = users[key];
-    if (!u) { reply(res, 404, { error: 'Böyle bir kullanıcı yok.' }); return true; }
-    if (!u.email) { reply(res, 400, { error: 'Bu hesaba e-posta bağlı değil, şifre sıfırlanamıyor.' }); return true; }
-    const err = await issueCode('reset:' + key, u.email, 'reset');
-    if (err) { reply(res, 429, { error: err }); return true; }
-    reply(res, 200, { ok: true, email: maskEmail(u.email) });
-    return true;
-  }
-
-  if (path === '/social/reset') {
-    if (hit(codeHits, ip, 20, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
-    const key = lc(body.username);
-    const u = users[key];
-    if (!validPw(body.password)) { reply(res, 400, { error: 'Şifre en az 4 karakter olmalı.' }); return true; }
-    if (!u || !u.email) { reply(res, 404, { error: 'Böyle bir hesap yok.' }); return true; }
-    const bad = checkCode('reset:' + key, body.code);
-    if (bad) { reply(res, 400, { error: bad }); return true; }
-    u.pw = await hashPw(body.password);
-    indexTokens(u);
-    u.tokens.forEach((t) => tokenIndex.delete(t));   // şifre sıfırlanınca tüm cihazların oturumu kapanır
-    u.tokens = [];
-    loginFails.delete(key);
-    touch(u);
-    reply(res, 200, { ok: true });
-    return true;
-  }
-
-  if (path === '/social/login') {
-    if (hit(loginHits, ip, 20, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
-    const key = lc(body.username);
-    const u = users[key];
-    if (hit(loginFails, key, 8, 15 * 60 * 1000) && loginFails.get(key).count > 8) { reply(res, 429, { error: 'Bu hesap için çok fazla yanlış deneme. 15 dakika sonra tekrar dene.' }); return true; }
-    if (!u || typeof body.password !== 'string' || !(await checkPw(body.password, u.pw))) {
-      reply(res, 403, { error: 'Kullanıcı adı veya şifre yanlış.' }); return true;
-    }
-    loginFails.delete(key);
-    const token = crypto.randomBytes(24).toString('hex');
-    addToken(u, token);
-    touch(u);
-    reply(res, 200, { token, username: u.username, avatarV: u.avatarV || 0 });
     return true;
   }
 
@@ -353,72 +236,10 @@ async function handle(req, res, path, body, ip, reply) {
   if (!me) { reply(res, 401, { error: 'Oturum geçersiz. Sosyal hesabını yeniden oluştur.' }); return true; }
 
   switch (path) {
-    case '/social/logout': {
-      const h = sha(tokenOf(req));
-      indexTokens(me);
-      me.tokens = me.tokens.filter((t) => t !== h);
-      tokenIndex.delete(h);
-      me.lastSeen = Date.now() - ONLINE_MS; me.playing = null;
-      touch(me);
-      reply(res, 200, { ok: true });
-      return true;
-    }
-
-    case '/social/email-code': {
-      if (hit(codeHits, ip, 10, 10 * 60 * 1000)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
-      if (!mail.enabled) { reply(res, 503, { error: 'Bu sunucuda e-posta ayarlı değil.' }); return true; }
-      const email = normEmail(body.email);
-      if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
-      if (emailTaken(email, lc(me.username))) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
-      const err = await issueCode('link:' + lc(me.username) + ':' + email, email, 'link');
-      if (err) { reply(res, 429, { error: err }); return true; }
-      reply(res, 200, { ok: true });
-      return true;
-    }
-
-    case '/social/email-set': {
-      const email = normEmail(body.email);
-      if (!isEmail(email)) { reply(res, 400, { error: 'Geçerli bir e-posta adresi yaz.' }); return true; }
-      if (emailTaken(email, lc(me.username))) { reply(res, 409, { error: 'Bu e-posta başka bir hesaba bağlı.' }); return true; }
-      const bad = checkCode('link:' + lc(me.username) + ':' + email, body.code);
-      if (bad) { reply(res, 400, { error: bad }); return true; }
-      me.email = email;
-      touch(me);
-      reply(res, 200, { ok: true, email: maskEmail(email) });
-      return true;
-    }
-
-    case '/social/password': {
-      if (!validPw(body.password)) { reply(res, 400, { error: 'Şifre en az 4 karakter olmalı.' }); return true; }
-      if (me.pw) {   // eski şifre gerekir (şifresi olmayan eski hesaplar ilk kez serbestçe koyar)
-        const k = 'pw:' + lc(me.username);
-        if (hit(loginFails, k, 8, 15 * 60 * 1000) && loginFails.get(k).count > 8) { reply(res, 429, { error: 'Çok fazla yanlış deneme. Biraz bekle.' }); return true; }
-        if (typeof body.old !== 'string' || !(await checkPw(body.old, me.pw))) { reply(res, 403, { error: 'Mevcut şifre yanlış.' }); return true; }
-        loginFails.delete(k);
-      }
-      me.pw = await hashPw(body.password);
-      touch(me);
-      reply(res, 200, { ok: true });
-      return true;
-    }
-
-    case '/social/data-get': {
-      try { reply(res, 200, await readData(me)); }
-      catch (e) { reply(res, 503, { error: 'Yedek okunamadı.' }); }
-      return true;
-    }
-
-    case '/social/data-put': {
-      if (typeof body.data !== 'string' || body.data.length > MAX_DATA) { reply(res, 413, { error: 'Yedek çok büyük.' }); return true; }
-      try { reply(res, 200, { ok: true, rev: await writeData(me, body.data) }); }
-      catch (e) { console.error('Yedek yazılamadı:', e.message); reply(res, 503, { error: 'Yedek kaydedilemedi.' }); }
-      return true;
-    }
-
     case '/social/heartbeat':
       me.lastSeen = Date.now();
       me.playing = cleanPlaying(body.playing);   // gönderilmezse "dinlemiyor" sayılır
-      reply(res, 200, { ok: true });
+      reply(res, 200, Object.assign({ ok: true }, snapshot(me)));
       return true;
 
     case '/social/offline':
@@ -427,19 +248,9 @@ async function handle(req, res, path, body, ip, reply) {
       reply(res, 200, { ok: true });
       return true;
 
-    case '/social/friends': {
-      // Not: burada lastSeen güncellenmez; çevrim içi bilgisi yalnızca /social/heartbeat ile gelir
-      // (arka planda listeyi yenilemek kullanıcıyı yanlışlıkla "çevrim içi" göstermesin).
-      const list = (arr) => arr.map((n) => users[n]).filter(Boolean);
-      reply(res, 200, {
-        friends: list(me.friends).map(view),
-        incoming: list(me.incoming).map((u) => ({ username: u.username, avatarV: u.avatarV || 0 })),
-        outgoing: list(me.outgoing).map((u) => ({ username: u.username, avatarV: u.avatarV || 0 })),
-        me: { username: me.username, avatarV: me.avatarV || 0, hasPassword: Boolean(me.pw), email: me.email ? maskEmail(me.email) : null },
-        inbox: me.inbox.length
-      });
+    case '/social/friends':
+      reply(res, 200, snapshot(me));
       return true;
-    }
 
     case '/social/friend-request': {
       const t = users[lc(body.username)];
@@ -505,57 +316,6 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
     }
 
-    case '/social/taste': {
-      const arr = Array.isArray(body.artists) ? body.artists : [];
-      me.taste = arr.map((x) => String(x || '').trim().slice(0, 60)).filter(Boolean).slice(0, 12);
-      touch(me);
-      reply(res, 200, { ok: true });
-      return true;
-    }
-
-    case '/social/blend': {
-      const t = users[lc(body.username)];
-      if (!t || !me.friends.includes(lc(t.username))) { reply(res, 404, { error: 'Bu kişi arkadaş listende yok.' }); return true; }
-      reply(res, 200, { artists: Array.isArray(t.taste) ? t.taste : [] });
-      return true;
-    }
-
-    case '/social/search': {
-      const q = lc(body.q).replace(/[^a-z0-9_.]/g, '').slice(0, 20);
-      if (q.length < 2) { reply(res, 200, { users: [] }); return true; }
-      const mine = lc(me.username);
-      const hits = [];
-      for (const [k, u] of Object.entries(users)) {
-        if (k === mine) continue;
-        const at = k.indexOf(q);
-        if (at < 0) continue;
-        const relation = me.friends.includes(k) ? 'friend' : me.outgoing.includes(k) ? 'outgoing' : me.incoming.includes(k) ? 'incoming' : 'none';
-        hits.push({ username: u.username, avatarV: u.avatarV || 0, relation, at });
-      }
-      hits.sort((x, y) => x.at - y.at || x.username.length - y.username.length || x.username.localeCompare(y.username));
-      reply(res, 200, { users: hits.slice(0, 8).map(({ at, ...r }) => r) });
-      return true;
-    }
-
-    case '/social/avatar': {
-      if (body.image === null || body.image === '') {          // kaldır
-        delete me.avatar; me.avatarV = 0; touch(me);
-        reply(res, 200, { ok: true, avatarV: 0 });
-        return true;
-      }
-      if (typeof body.image !== 'string' || !/^[A-Za-z0-9+/=\s]+$/.test(body.image)) { reply(res, 400, { error: 'Geçersiz resim.' }); return true; }
-      if (Date.now() - (me.avatarAt || 0) < 3000) { reply(res, 429, { error: 'Çok sık değiştiriyorsun. Biraz bekle.' }); return true; }
-      const buf = Buffer.from(body.image, 'base64');
-      if (buf.length < 100 || buf.length > MAX_AVATAR) { reply(res, 413, { error: 'Resim çok büyük.' }); return true; }
-      if (!(buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff)) { reply(res, 400, { error: 'Yalnızca JPEG resim kabul edilir.' }); return true; }
-      me.avatar = buf.toString('base64');
-      me.avatarV = Date.now();
-      me.avatarAt = Date.now();
-      touch(me);
-      reply(res, 200, { ok: true, avatarV: me.avatarV });
-      return true;
-    }
-
     case '/social/rename': {
       const name = String(body.username || '').trim();
       if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
@@ -585,6 +345,33 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
     }
 
+    case '/social/avatar-set': {
+      if (Date.now() - (me.avatarAt || 0) < 3000) { reply(res, 429, { error: 'Biraz bekleyip tekrar dene.' }); return true; }
+      const b64 = String(body.image || '');
+      if (b64.length > 100000) { reply(res, 400, { error: 'Fotoğraf çok büyük.' }); return true; }
+      const buf = Buffer.from(b64, 'base64');
+      const jpeg = buf.length > 100 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+      if (!jpeg || buf.length > AVATAR_MAX) { reply(res, 400, { error: 'Geçersiz fotoğraf.' }); return true; }
+      const id = crypto.randomBytes(8).toString('hex');
+      try { await blobSet(id, buf); } catch (e) { console.error('Fotoğraf kaydı:', e.message); reply(res, 503, { error: 'Fotoğraf kaydedilemedi. Tekrar dene.' }); return true; }
+      const old = me.avatar;
+      me.avatar = id; me.avatarAt = Date.now();
+      cachePut(id, buf);
+      touch(me);
+      if (old) { avatarCache.delete(old); blobDel(old).catch(() => {}); }
+      reply(res, 200, { ok: true, avatar: id });
+      return true;
+    }
+
+    case '/social/avatar-clear': {
+      const old = me.avatar;
+      me.avatar = null;
+      touch(me);
+      if (old) { avatarCache.delete(old); blobDel(old).catch(() => {}); }
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
     case '/social/inbox':
       reply(res, 200, { items: me.inbox });
       return true;
@@ -601,20 +388,4 @@ async function handle(req, res, path, body, ip, reply) {
   }
 }
 
-// GET /social/avatar/<kullanıcı>: profil resmini döndürür (giriş yapmış kullanıcılar; arama sonuçlarında da görünsün diye).
-async function handleGet(req, res, path) {
-  const m = /^\/social\/avatar\/([a-zA-Z0-9_.]{3,20})$/.exec(path);
-  if (!m) return false;
-  const fail = (code) => { res.writeHead(code, { 'Content-Type': 'text/plain' }); res.end(); return true; };
-  if (!(await ensureLoaded())) return fail(503);
-  const me = authUser(req);
-  if (!me) return fail(401);
-  const t = users[lc(m[1])];
-  if (!t || !t.avatar) return fail(404);
-  const buf = Buffer.from(t.avatar, 'base64');
-  res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': buf.length, 'Cache-Control': 'private, max-age=31536000, immutable' });
-  res.end(buf);
-  return true;
-}
-
-module.exports = { handle, handleGet };
+module.exports = { handle, serveAvatar };
