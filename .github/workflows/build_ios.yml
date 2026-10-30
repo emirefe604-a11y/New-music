@@ -8,22 +8,40 @@ on:
 jobs:
   build-ios:
     name: Build iOS IPA
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Extract ZIP
+      - name: Extract ZIP if present
         run: |
           if [ -f "NewMusic.zip" ]; then
-            echo "Unzipping NewMusic.zip..."
+            echo "Found NewMusic.zip, unzipping..."
             unzip -o NewMusic.zip
+          fi
+
+      - name: Locate iOS Project
+        id: find_project
+        run: |
+          if [ -d "iosApp/iosApp.xcodeproj" ]; then
+            echo "PROJECT_DIR=iosApp" >> $GITHUB_ENV
+          elif [ -d "NewMusic/iosApp/iosApp.xcodeproj" ]; then
+            echo "PROJECT_DIR=NewMusic/iosApp" >> $GITHUB_ENV
+          else
+            echo "Searching for iosApp.xcodeproj..."
+            FOUND=$(find . -name "iosApp.xcodeproj" | head -n 1)
+            if [ -n "$FOUND" ]; then
+              echo "PROJECT_DIR=$(dirname "$FOUND")" >> $GITHUB_ENV
+            else
+              echo "Error: iosApp.xcodeproj not found!"
+              exit 1
+            fi
           fi
 
       - name: Build iOS Application (.app)
         run: |
-          cd NewMusic/iosApp
+          cd ${{ env.PROJECT_DIR }}
           xcodebuild clean build \
             -project iosApp.xcodeproj \
             -scheme iosApp \
@@ -37,8 +55,13 @@ jobs:
 
       - name: Package into IPA
         run: |
-          cd NewMusic/iosApp
+          cd ${{ env.PROJECT_DIR }}
           APP_PATH=$(find build/Build/Products/Release-iphoneos -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: .app bundle not found!"
+            exit 1
+          fi
+          echo "Found app at $APP_PATH"
           mkdir -p Payload
           cp -r "$APP_PATH" Payload/
           zip -r NewMusic.ipa Payload/
