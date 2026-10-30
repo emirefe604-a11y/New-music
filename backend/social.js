@@ -6,7 +6,8 @@
 //  /social/avatar-set      { image: base64 JPEG }          -> { ok, avatar }
 //  /social/avatar-clear    {}                              -> { ok }
 //  GET /social/avatar/<id>                                 -> JPEG (id tahmin edilemez, arkadaşın listesinde görünür)
-//  /social/rename          { username }                    -> { ok, username }
+//  /social/display-name    { name }                        -> { ok, name }   (görünen ad: benzersiz olmak zorunda değil)
+//  /social/rename          { username }                    -> { ok, username }   (kimliği değiştirir; uygulama kullanmıyor)
 //  /social/offline         {}                              -> { ok }       (uygulama kapanırken)
 //  /social/friends         {}                              -> { friends, incoming, outgoing }
 //  /social/friend-request  { username }                    -> { ok }
@@ -15,6 +16,8 @@
 //  /social/share           { to: [username], name, songs } -> { ok, sent }
 //  /social/inbox           {}                              -> { items }
 //  /social/inbox-dismiss   { id }                          -> { ok }
+//  /social/taste-set       { artists:[{n, w}] }            -> { ok }       (Blend için en çok dinlenen sanatçılar)
+//  /social/blend           { username }                    -> { me, friend }  (yalnızca arkadaşlar; iki tarafın zevki)
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -38,6 +41,20 @@ const users = {};
 const MEMORY_ONLY = new Set(['lastSeen', 'playing', 'renamedAt', 'avatarAt']);   // bellekte kalır, veritabanına yazılmaz
 const ser = (u) => JSON.stringify(u, (k, v) => (MEMORY_ONLY.has(k) ? undefined : v));
 const removed = new Set();   // adı değişen kullanıcıların eski anahtarları
+const tokenIndex = new Map();   // tokenHash -> kullanıcı (her istekte tüm kullanıcıları taramamak için)
+const MAX_TOKENS = 5;           // aynı hesapla en fazla 5 cihaz oturumu
+
+function normalizeUser(u) {
+  for (const f of ['friends', 'incoming', 'outgoing', 'inbox']) if (!Array.isArray(u[f])) u[f] = [];
+  if (!Array.isArray(u.tokenHashes)) u.tokenHashes = [];
+  if (u.tokenHash && !u.tokenHashes.includes(u.tokenHash)) u.tokenHashes.push(u.tokenHash);   // eski kayıt biçimi
+  delete u.tokenHash;
+  if (!Array.isArray(u.taste)) u.taste = [];
+  if (!u.displayName) u.displayName = u.username;
+  u.lastSeen = 0;
+  return u;
+}
+function indexUser(u) { for (const h of u.tokenHashes) tokenIndex.set(h, u); }
 
 async function redis(cmds) {
   const r = await fetch(REDIS_URL + '/pipeline', {
@@ -61,13 +78,13 @@ async function loadAll() {
       const [res] = await redis([['MGET', ...chunk.map((n) => 'u:' + n)]]);
       (res.result || []).forEach((v) => {
         if (!v) return;
-        try { const u = JSON.parse(v); u.lastSeen = 0; users[String(u.username).toLowerCase()] = u; } catch (e) { /* bozuk kayıt */ }
+        try { const u = normalizeUser(JSON.parse(v)); users[String(u.username).toLowerCase()] = u; indexUser(u); } catch (e) { /* bozuk kayıt */ }
       });
     }
   } else {
     try {
       const all = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      for (const [k, u] of Object.entries(all)) { u.lastSeen = 0; users[k] = u; }
+      for (const [k, u] of Object.entries(all)) { try { users[k] = normalizeUser(u); indexUser(u); } catch (e) { /* bozuk kayıt */ } }
     } catch (e) { /* ilk çalışma */ }
   }
 }
@@ -151,8 +168,11 @@ async function flush(retryMs) {
   }
 }
 
+// Sunucu kapanırken (Render yeniden başlatma) bekleyen değişiklikleri hemen yazar
+async function flushNow() { if (timer) { clearTimeout(timer); timer = null; } await flush(); }
+
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex');
-const lc = (s) => String(s || '').trim().toLowerCase();
+const lc = (s) => String(s || '').trim().replace(/^@+/, '').toLowerCase();
 const validName = (s) => /^[a-zA-Z0-9_.]{3,20}$/.test(s);
 const joinHits = new Map();
 
@@ -160,17 +180,59 @@ function authUser(req) {
   const h = String(req.headers['authorization'] || '');
   const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
   if (!token) return null;
-  const th = sha(token);
-  for (const u of Object.values(users)) {
-    const a = Buffer.from(u.tokenHash), b = Buffer.from(th);
-    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return u;
+  return tokenIndex.get(sha(token)) || null;
+}
+
+// Hesap (e-posta) girişi için: kullanıcı oluşturur / mevcut kullanıcıya yeni cihaz anahtarı verir.
+function joinAllowed(ip) {
+  const now = Date.now();
+  let h = joinHits.get(ip);
+  if (!h || h.reset < now) { h = { count: 0, reset: now + 10 * 60 * 1000 }; joinHits.set(ip, h); }
+  return ++h.count <= JOIN_LIMIT;
+}
+function createUser(name, display) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const u = { username: name, displayName: String(display || name).trim().slice(0, 30) || name, tokenHashes: [sha(token)], lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [], taste: [] };
+  users[lc(name)] = u;
+  indexUser(u);
+  touch(u);
+  return { token, username: name };
+}
+function issueToken(username) {
+  const u = users[lc(username)];
+  if (!u) return null;
+  const token = crypto.randomBytes(24).toString('hex');
+  u.tokenHashes.push(sha(token));
+  while (u.tokenHashes.length > MAX_TOKENS) tokenIndex.delete(u.tokenHashes.shift());
+  indexUser(u);
+  touch(u);
+  return { token, username: u.username };
+}
+const userExists = (name) => Boolean(users[lc(name)]);
+
+// Benzersiz kimlik (arkadaş ekleme için): e-postanın baş kısmı + rastgele sayı, örn. "emir_4821". Kullanıcı bulmak zorunda kalmaz.
+function generateId(seed) {
+  let base = String(seed || '').toLowerCase().replace(/[^a-z0-9_.]/g, '').slice(0, 12);
+  if (base.length < 3) base = (base + 'user').slice(0, 12);
+  for (let i = 0; i < 50; i++) {
+    const id = base + '_' + crypto.randomInt(1000, 10000);
+    if (!users[lc(id)]) return id;
   }
-  return null;
+  return base + '_' + crypto.randomBytes(4).toString('hex');
+}
+function setDisplayName(username, name) {
+  const u = users[lc(username)];
+  const n = String(name || '').trim().slice(0, 30);
+  if (!u || !n) return false;
+  u.displayName = n;
+  touch(u);
+  return true;
 }
 
 const isOnline = (u) => u.lastSeen > 0 && Date.now() - u.lastSeen < ONLINE_MS;
+const dname = (u) => u.displayName || u.username;
 const view = (u) => {
-  const v = { username: u.username, online: isOnline(u), lastSeen: u.lastSeen || 0, avatar: u.avatar || null };
+  const v = { username: u.username, name: dname(u), online: isOnline(u), lastSeen: u.lastSeen || 0, avatar: u.avatar || null };
   if (v.online && u.playing) v.listening = u.playing;   // yalnızca çevrim içiyken gösterilir
   return v;
 };
@@ -178,10 +240,10 @@ const view = (u) => {
 function snapshot(me) {
   const list = (arr) => arr.map((n) => users[n]).filter(Boolean);
   return {
-    me: { username: me.username, avatar: me.avatar || null },
+    me: { username: me.username, name: dname(me), avatar: me.avatar || null },
     friends: list(me.friends).map(view),
-    incoming: list(me.incoming).map((u) => ({ username: u.username, avatar: u.avatar || null })),
-    outgoing: list(me.outgoing).map((u) => ({ username: u.username, avatar: u.avatar || null })),
+    incoming: list(me.incoming).map((u) => ({ username: u.username, name: dname(u), avatar: u.avatar || null })),
+    outgoing: list(me.outgoing).map((u) => ({ username: u.username, name: dname(u), avatar: u.avatar || null })),
     inbox: me.inbox.length
   };
 }
@@ -218,17 +280,11 @@ async function handle(req, res, path, body, ip, reply) {
   if (!(await ensureLoaded())) { reply(res, 503, { error: 'Sunucu veritabanına ulaşamıyor. Biraz sonra tekrar dene.' }); return true; }
 
   if (path === '/social/join') {
-    const now = Date.now();
-    let h = joinHits.get(ip);
-    if (!h || h.reset < now) { h = { count: 0, reset: now + 10 * 60 * 1000 }; joinHits.set(ip, h); }
-    if (++h.count > JOIN_LIMIT) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
-    const name = String(body.username || '').trim();
+    if (!joinAllowed(ip)) { reply(res, 429, { error: 'Çok fazla deneme. Biraz sonra tekrar dene.' }); return true; }
+    const name = String(body.username || '').trim().replace(/^@+/, '');
     if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
     if (users[lc(name)]) { reply(res, 409, { error: 'Bu kullanıcı adı alınmış.' }); return true; }
-    const token = crypto.randomBytes(24).toString('hex');
-    users[lc(name)] = { username: name, tokenHash: sha(token), lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [] };
-    touch(users[lc(name)]);
-    reply(res, 200, { token, username: name });
+    reply(res, 200, createUser(name));
     return true;
   }
 
@@ -302,7 +358,7 @@ async function handle(req, res, path, body, ip, reply) {
         if (!t || !me.friends.includes(lc(t.username))) continue;   // yalnızca arkadaşlara
         t.inbox.unshift({
           id: crypto.randomBytes(6).toString('hex'),
-          from: me.username,
+          from: dname(me),
           name: String(body.name || 'Liste').slice(0, 40),
           songs,
           at: Date.now()
@@ -316,8 +372,17 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
     }
 
+    case '/social/display-name': {
+      const n = String(body.name || '').trim().slice(0, 30);
+      if (!n) { reply(res, 400, { error: 'Ad boş olamaz.' }); return true; }
+      me.displayName = n;
+      touch(me);
+      reply(res, 200, { ok: true, name: n });
+      return true;
+    }
+
     case '/social/rename': {
-      const name = String(body.username || '').trim();
+      const name = String(body.username || '').trim().replace(/^@+/, '');
       if (!validName(name)) { reply(res, 400, { error: 'Kullanıcı adı 3-20 karakter olmalı (harf, rakam, _ ve .).' }); return true; }
       if (Date.now() - (me.renamedAt || 0) < 60 * 1000) { reply(res, 429, { error: 'Adı çok sık değiştiremezsin. Biraz bekle.' }); return true; }
       const oldKey = lc(me.username), newKey = lc(name);
@@ -372,6 +437,31 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
     }
 
+    case '/social/taste-set': {
+      const arr = Array.isArray(body.artists) ? body.artists.slice(0, 30) : [];
+      const out = [];
+      for (const a of arr) {
+        if (!a || typeof a.n !== 'string') continue;
+        const n = a.n.trim().slice(0, 80);
+        if (!n) continue;
+        out.push({ n, w: Math.max(1, Math.min(100000, Math.round(Number(a.w) || 1))) });
+      }
+      me.taste = out;
+      touch(me);
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
+    case '/social/blend': {
+      const t = users[lc(body.username)];
+      if (!t || !me.friends.includes(lc(t.username))) { reply(res, 404, { error: 'Bu kişi arkadaş listende değil.' }); return true; }
+      reply(res, 200, {
+        me: { username: me.username, name: dname(me), avatar: me.avatar || null, artists: me.taste || [] },
+        friend: { username: t.username, name: dname(t), avatar: t.avatar || null, artists: t.taste || [] }
+      });
+      return true;
+    }
+
     case '/social/inbox':
       reply(res, 200, { items: me.inbox });
       return true;
@@ -388,4 +478,10 @@ async function handle(req, res, path, body, ip, reply) {
   }
 }
 
-module.exports = { handle, serveAvatar };
+if (!useRedis) console.warn('UYARI: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN yok. Veriler dosyaya yazılıyor; Render ücretsiz pakette sunucu yeniden başlayınca TÜM hesaplar ve arkadaşlıklar silinir.');
+
+module.exports = {
+  handle, serveAvatar, ensureLoaded, flushNow,
+  persistent: useRedis, redis, useRedis,
+  createUser, issueToken, userExists, generateId, setDisplayName, joinAllowed, validName, lc, sha
+};
