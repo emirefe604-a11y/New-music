@@ -18,6 +18,8 @@
 //  /social/inbox-dismiss   { id }                          -> { ok }
 //  /social/taste-set       { artists:[{n, w}] }            -> { ok }       (Blend için en çok dinlenen sanatçılar)
 //  /social/blend           { username }                    -> { me, friend }  (yalnızca arkadaşlar; iki tarafın zevki)
+//  /social/library-get     {}                              -> { exists, updatedAt, favs, playlists }   (hesaba bağlı beğeniler + listeler)
+//  /social/library-set     { favs, playlists }             -> { ok, updatedAt }
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -38,7 +40,7 @@ const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
 // users: username(lowercase) -> { username, tokenHash, lastSeen, friends:[lc], incoming:[lc], outgoing:[lc], inbox:[...] }
 // lastSeen yalnızca bellekte tutulur (kaydedilmez): böylece her sinyal veritabanına yazı yapmaz.
 const users = {};
-const MEMORY_ONLY = new Set(['lastSeen', 'playing', 'renamedAt', 'avatarAt']);   // bellekte kalır, veritabanına yazılmaz
+const MEMORY_ONLY = new Set(['lastSeen', 'playing', 'renamedAt', 'avatarAt', 'libSetAt']);   // bellekte kalır, veritabanına yazılmaz
 const ser = (u) => JSON.stringify(u, (k, v) => (MEMORY_ONLY.has(k) ? undefined : v));
 const removed = new Set();   // adı değişen kullanıcıların eski anahtarları
 const tokenIndex = new Map();   // tokenHash -> kullanıcı (her istekte tüm kullanıcıları taramamak için)
@@ -117,6 +119,53 @@ async function blobSet(id, buf) {
 async function blobDel(id) {
   if (useRedis) { await redis([['DEL', 'a:' + id]]); return; }
   try { await fs.promises.unlink(path.join(AVATAR_DIR, id + '.jpg')); } catch (e) { /* yok */ }
+}
+
+// ---- Beğeniler + çalma listeleri: Redis'te "l:<libId>" (JSON), Redis yoksa dosyada. Kullanıcı kaydını şişirmemek için ayrı tutulur. ----
+const LIB_DIR = process.env.LIB_DIR || './social-libs';
+const LIB_MAX_BYTES = 700 * 1024;   // Upstash isteği 1 MB sınırının altında kalsın
+async function libGet(id) {
+  if (useRedis) {
+    const [r] = await redis([['GET', 'l:' + id]]);
+    return r.result ? JSON.parse(r.result) : null;
+  }
+  try { return JSON.parse(await fs.promises.readFile(path.join(LIB_DIR, id + '.json'), 'utf8')); } catch (e) { return null; }
+}
+async function libSet(id, obj) {
+  const text = JSON.stringify(obj);
+  if (useRedis) { await redis([['SET', 'l:' + id, text]]); return; }
+  await fs.promises.mkdir(LIB_DIR, { recursive: true });
+  await fs.promises.writeFile(path.join(LIB_DIR, id + '.json'), text);
+}
+
+// Şarkı: { t: başlık, a: sanatçı, u: adres, i: kapak }. Cihazdaki yüklemeler (local://) sunucuya gitmez.
+function cleanLibSong(s) {
+  if (!s || typeof s.u !== 'string' || !s.u || s.u.length > 300 || s.u.startsWith('local://')) return null;
+  return { t: String(s.t || '').slice(0, 150), a: String(s.a || '').slice(0, 100), u: s.u, i: s.i ? String(s.i).slice(0, 300) : '' };
+}
+function cleanLibSongs(arr, max) {
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of arr) {
+    const s = cleanLibSong(raw);
+    if (!s || seen.has(s.u)) continue;
+    seen.add(s.u);
+    out.push(s);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+function cleanLibrary(body) {
+  const favs = cleanLibSongs(body.favs, 3000);
+  const playlists = [];
+  const ids = new Set();
+  for (const p of (Array.isArray(body.playlists) ? body.playlists.slice(0, 100) : [])) {
+    if (!p || typeof p.id !== 'string' || !p.id || p.id.length > 40 || ids.has(p.id)) continue;
+    ids.add(p.id);
+    playlists.push({ id: p.id, name: String(p.name || 'Liste').slice(0, 40), songs: cleanLibSongs(p.songs, 1000) });
+  }
+  return { favs, playlists };
 }
 
 async function serveAvatar(req, res) {
@@ -459,6 +508,28 @@ async function handle(req, res, path, body, ip, reply) {
         me: { username: me.username, name: dname(me), avatar: me.avatar || null, artists: me.taste || [] },
         friend: { username: t.username, name: dname(t), avatar: t.avatar || null, artists: t.taste || [] }
       });
+      return true;
+    }
+
+    case '/social/library-get': {
+      if (!me.libId) { reply(res, 200, { exists: false, updatedAt: 0, favs: [], playlists: [] }); return true; }
+      let lib;
+      try { lib = await libGet(me.libId); } catch (e) { console.error('Kitaplık okuma:', e.message); reply(res, 503, { error: 'Kitaplık okunamadı. Biraz sonra tekrar dene.' }); return true; }
+      if (!lib) { reply(res, 200, { exists: false, updatedAt: 0, favs: [], playlists: [] }); return true; }
+      reply(res, 200, { exists: true, updatedAt: me.libAt || 0, favs: lib.favs || [], playlists: lib.playlists || [] });
+      return true;
+    }
+
+    case '/social/library-set': {
+      if (Date.now() - (me.libSetAt || 0) < 1000) { reply(res, 429, { error: 'Çok sık kaydediliyor. Biraz bekle.' }); return true; }
+      const lib = cleanLibrary(body);
+      if (Buffer.byteLength(JSON.stringify(lib)) > LIB_MAX_BYTES) { reply(res, 413, { error: 'Kitaplık çok büyük, kaydedilemedi.' }); return true; }
+      if (!me.libId) me.libId = crypto.randomBytes(12).toString('hex');
+      try { await libSet(me.libId, lib); } catch (e) { console.error('Kitaplık kaydı:', e.message); reply(res, 503, { error: 'Kitaplık kaydedilemedi. Tekrar dene.' }); return true; }
+      me.libSetAt = Date.now();
+      me.libAt = Math.max(Date.now(), (me.libAt || 0) + 1);
+      touch(me);
+      reply(res, 200, { ok: true, updatedAt: me.libAt });
       return true;
     }
 

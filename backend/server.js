@@ -47,7 +47,8 @@ http.createServer(async (req, res) => {
     if (req.method === 'GET' && path.startsWith('/social/avatar/')) return await social.serveAvatar(req, res);
     if (req.method !== 'POST') return send(res, 404, { error: 'Bulunamadı' });
 
-    const body = await readJson(req, path.startsWith('/social/') ? 200 * 1024 : 8 * 1024);
+    const limit = path === '/social/library-set' ? 1024 * 1024 : path.startsWith('/social/') ? 200 * 1024 : 8 * 1024;
+    const body = await readJson(req, limit);
     if (await accounts.handle(req, res, path, body, ip, send)) return;
     if (await social.handle(req, res, path, body, ip, send)) return;
     send(res, 404, { error: 'Bulunamadı' });
