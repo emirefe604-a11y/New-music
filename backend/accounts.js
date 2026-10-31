@@ -94,10 +94,29 @@ function newSession(acc) {
   return session;
 }
 
-// Her hesabın bir arkadaş kimliği vardır; yoksa e-postadan otomatik üretilir (kullanıcı isim bulmak zorunda kalmaz).
+// Her hesabın bir arkadaş kimliği vardır; yoksa rastgele üretilir (e-posta adresi ASLA kullanılmaz).
+// Eski hesaplarda kimlik e-postadan türetilmişti (örn. "emir_4821"); bu tür kimlikler rastgele ada çevrilir.
+function emailDerived(acc) {
+  const base = String(acc.email.split('@')[0]).toLowerCase().replace(/[^a-z0-9_.]/g, '').slice(0, 12);
+  const b = base.length < 3 ? (base + 'user').slice(0, 12) : base;
+  return new RegExp('^' + b.replace(/[.]/g, '\\.') + '_\\d{4}$|^' + b.replace(/[.]/g, '\\.') + '_[a-f0-9]{8}$', 'i').test(acc.social || '');
+}
 function socialFor(acc) {
-  if (acc.social && social.userExists(acc.social)) return social.issueToken(acc.social);   // { token, username }
-  const made = social.createUser(social.generateId(acc.email.split('@')[0]), acc.name);
+  if (acc.social && social.userExists(acc.social)) {
+    if (emailDerived(acc)) {
+      for (let i = 0; i < 20; i++) {
+        const id = social.generateId('');
+        if (social.renameUser(acc.social, id)) {
+          acc.social = id;
+          social.setDisplayName(id, acc.name || 'Kullanıcı');   // eski görünen ad e-posta kökenli olabilir; hesaptaki ad kullanılır
+          persist(acc).catch((e) => console.error('Kimlik kaydedilemedi:', e.message));
+          break;
+        }
+      }
+    }
+    return social.issueToken(acc.social);   // { token, username }
+  }
+  const made = social.createUser(social.generateId(''), acc.name);
   acc.social = made.username;
   persist(acc).catch((e) => console.error('Kimlik kaydedilemedi:', e.message));
   return made;

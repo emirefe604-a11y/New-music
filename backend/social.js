@@ -20,6 +20,10 @@
 //  /social/blend           { username }                    -> { me, friend }  (yalnızca arkadaşlar; iki tarafın zevki)
 //  /social/library-get     {}                              -> { exists, updatedAt, favs, playlists }   (hesaba bağlı beğeniler + listeler)
 //  /social/library-set     { favs, playlists }             -> { ok, updatedAt }
+//  /social/user-lists      { username }                    -> { lists:[{id,name,songs,likes,liked}] }   (bir kullanıcının HERKESE AÇIK listeleri)
+//  /social/public-lists    {}                              -> { lists:[{owner,ownerName,avatar,id,name,count,cover,likes,liked}] }   (keşfet: en çok beğenilenler)
+//  /social/public-list     { username, id }                -> { list:{id,name,songs,likes,liked} }   (herkese açık TEK liste, şarkılarıyla)
+//  /social/list-like       { username, id, like }          -> { ok, likes }   (herkese açık bir listeyi beğen / beğenmekten vazgeç)
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -32,7 +36,7 @@ const useRedis = Boolean(REDIS_URL && REDIS_TOKEN);
 
 const ONLINE_MS = 50 * 1000;      // son sinyalden bu yana 50 sn geçmediyse "çevrim içi" (uygulama 5-15 sn'de bir sinyal yollar)
 const AVATAR_DIR = process.env.AVATAR_DIR || './social-avatars';
-const AVATAR_MAX = 64 * 1024;     // profil fotoğrafı en fazla 64 KB (uygulama 256x256 JPEG yollar)
+const AVATAR_MAX = 180 * 1024;     // profil fotoğrafı en fazla 64 KB (uygulama 256x256 JPEG yollar)
 const MAX_SONGS = 100;
 const MAX_INBOX = 20;
 const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
@@ -40,7 +44,9 @@ const JOIN_LIMIT = 5;             // IP başına 10 dakikada en fazla 5 hesap
 // users: username(lowercase) -> { username, tokenHash, lastSeen, friends:[lc], incoming:[lc], outgoing:[lc], inbox:[...] }
 // lastSeen yalnızca bellekte tutulur (kaydedilmez): böylece her sinyal veritabanına yazı yapmaz.
 const users = {};
+// "seenAt" (son görülme) KALICIDIR: sunucu yeniden başlasa da arkadaşların "Son görülme" bilgisi kaybolmaz.
 const MEMORY_ONLY = new Set(['lastSeen', 'playing', 'renamedAt', 'avatarAt', 'libSetAt']);   // bellekte kalır, veritabanına yazılmaz
+const SEEN_PERSIST_MS = 2 * 60 * 1000;   // çevrim içiyken son görülme en fazla 2 dakikada bir veritabanına yazılır
 const ser = (u) => JSON.stringify(u, (k, v) => (MEMORY_ONLY.has(k) ? undefined : v));
 const removed = new Set();   // adı değişen kullanıcıların eski anahtarları
 const tokenIndex = new Map();   // tokenHash -> kullanıcı (her istekte tüm kullanıcıları taramamak için)
@@ -53,6 +59,7 @@ function normalizeUser(u) {
   delete u.tokenHash;
   if (!Array.isArray(u.taste)) u.taste = [];
   if (!u.displayName) u.displayName = u.username;
+  if (typeof u.seenAt !== 'number') u.seenAt = 0;
   u.lastSeen = 0;
   return u;
 }
@@ -140,8 +147,13 @@ async function libSet(id, obj) {
 
 // Şarkı: { t: başlık, a: sanatçı, u: adres, i: kapak }. Cihazdaki yüklemeler (local://) sunucuya gitmez.
 function cleanLibSong(s) {
-  if (!s || typeof s.u !== 'string' || !s.u || s.u.length > 300 || s.u.startsWith('local://')) return null;
-  return { t: String(s.t || '').slice(0, 150), a: String(s.a || '').slice(0, 100), u: s.u, i: s.i ? String(s.i).slice(0, 300) : '' };
+  if (!s) return null;
+  const u = typeof s.u === 'string' && s.u ? s.u : (typeof s.url === 'string' ? s.url : '');
+  if (!u || u.length > 300 || u.startsWith('local://')) return null;
+  const t = String(s.t || s.title || '').slice(0, 150);
+  const a = String(s.a || s.artist || '').slice(0, 100);
+  const i = s.i ? String(s.i).slice(0, 300) : (s.thumb ? String(s.thumb).slice(0, 300) : '');
+  return { t, a, u, i };
 }
 function cleanLibSongs(arr, max) {
   if (!Array.isArray(arr)) return [];
@@ -156,6 +168,11 @@ function cleanLibSongs(arr, max) {
   }
   return out;
 }
+// Liste kapağı: kapak resmi olan ilk şarkının resmi (ilk şarkının resmi yoksa sıradakine bakılır)
+function coverOf(songs) {
+  const s = (songs || []).find((x) => x && x.i);
+  return s ? s.i : null;
+}
 function cleanLibrary(body) {
   const favs = cleanLibSongs(body.favs, 3000);
   const playlists = [];
@@ -163,7 +180,8 @@ function cleanLibrary(body) {
   for (const p of (Array.isArray(body.playlists) ? body.playlists.slice(0, 100) : [])) {
     if (!p || typeof p.id !== 'string' || !p.id || p.id.length > 40 || ids.has(p.id)) continue;
     ids.add(p.id);
-    playlists.push({ id: p.id, name: String(p.name || 'Liste').slice(0, 40), songs: cleanLibSongs(p.songs, 1000) });
+    const isPub = p.pub === true || p.pub === 'true';
+    playlists.push({ id: p.id, name: String(p.name || 'Liste').slice(0, 40), pub: isPub, cover: typeof p.cover === 'string' ? p.cover.slice(0, 500) : null, songs: cleanLibSongs(p.songs, 1000) });
   }
   return { favs, playlists };
 }
@@ -261,6 +279,10 @@ const userExists = (name) => Boolean(users[lc(name)]);
 
 // Benzersiz kimlik (arkadaş ekleme için): e-postanın baş kısmı + rastgele sayı, örn. "emir_4821". Kullanıcı bulmak zorunda kalmaz.
 function generateId(seed) {
+  if (!seed) {   // e-postadan bağımsız, rastgele kimlik: sd_a1b2c3
+    for (let i = 0; i < 50; i++) { const id = 'sd_' + crypto.randomBytes(3).toString('hex'); if (!users[lc(id)]) return id; }
+    return 'sd_' + crypto.randomBytes(6).toString('hex');
+  }
   let base = String(seed || '').toLowerCase().replace(/[^a-z0-9_.]/g, '').slice(0, 12);
   if (base.length < 3) base = (base + 'user').slice(0, 12);
   for (let i = 0; i < 50; i++) {
@@ -278,10 +300,50 @@ function setDisplayName(username, name) {
   return true;
 }
 
+// Sunucu içi yeniden adlandırma (hesap kimliği değişince arkadaşlıklar korunur). Başarılıysa true.
+function renameUser(oldName, newName) {
+  const oldKey = lc(oldName), newKey = lc(newName);
+  const me = users[oldKey];
+  if (!me || !validName(newName) || users[newKey]) return false;
+  delete users[oldKey];
+  users[newKey] = me;
+  removed.add(oldKey);
+  const others = new Set([...me.friends, ...me.incoming, ...me.outgoing]);
+  const changed = [];
+  for (const k of others) {
+    const o = users[k];
+    if (!o) continue;
+    for (const f of ['friends', 'incoming', 'outgoing']) o[f] = o[f].map((x) => (x === oldKey ? newKey : x));
+    // beğeniler: bu kullanıcının başkalarının listelerine verdiği beğeniler
+    changed.push(o);
+  }
+  for (const u of Object.values(users)) {
+    if (!u.likes) continue;
+    for (const id of Object.keys(u.likes)) {
+      if (u.likes[id].includes(oldKey)) { u.likes[id] = u.likes[id].map((x) => (x === oldKey ? newKey : x)); changed.push(u); }
+    }
+  }
+  me.username = newName;
+  touch(me, ...changed);
+  return true;
+}
+
 const isOnline = (u) => u.lastSeen > 0 && Date.now() - u.lastSeen < ONLINE_MS;
 const dname = (u) => u.displayName || u.username;
+const seenTime = (u) => Math.max(u.lastSeen || 0, u.seenAt || 0);
 const view = (u) => {
-  const v = { username: u.username, name: dname(u), online: isOnline(u), lastSeen: u.lastSeen || 0, avatar: u.avatar || null };
+  const seen = seenTime(u);
+  // seenAgo: "ne kadar önce" (ms). Telefonun saati yanlış olsa bile son görülme doğru gösterilir. -1: hiç görülmedi.
+  const v = {
+    username: u.username,
+    name: dname(u),
+    online: isOnline(u),
+    lastSeen: seen,
+    seenAgo: seen > 0 ? Math.max(0, Date.now() - seen) : -1,
+    avatar: u.avatar || null,
+    profileSong: u.profileSong || null,
+    status: (u.status && Date.now() - (u.status.createdAt || 0) < 24 * 3600 * 1000) ? u.status : null
+  };
   if (v.online && u.playing) v.listening = u.playing;   // yalnızca çevrim içiyken gösterilir
   return v;
 };
@@ -289,7 +351,13 @@ const view = (u) => {
 function snapshot(me) {
   const list = (arr) => arr.map((n) => users[n]).filter(Boolean);
   return {
-    me: { username: me.username, name: dname(me), avatar: me.avatar || null },
+    me: {
+      username: me.username,
+      name: dname(me),
+      avatar: me.avatar || null,
+      profileSong: me.profileSong || null,
+      status: (me.status && Date.now() - (me.status.createdAt || 0) < 24 * 3600 * 1000) ? me.status : null
+    },
     friends: list(me.friends).map(view),
     incoming: list(me.incoming).map((u) => ({ username: u.username, name: dname(u), avatar: u.avatar || null })),
     outgoing: list(me.outgoing).map((u) => ({ username: u.username, name: dname(u), avatar: u.avatar || null })),
@@ -309,15 +377,22 @@ function cleanSongs(songs) {
   const seen = new Set();
   const out = [];
   for (const s of songs.slice(0, MAX_SONGS)) {
-    if (!s || typeof s.url !== 'string' || !s.url) continue;
-    if (s.url.startsWith('local://')) continue;        // cihazdaki yüklenen dosyalar paylaşılamaz
-    if (s.url.length > 300 || seen.has(s.url)) continue;
-    seen.add(s.url);
+    if (!s) continue;
+    const url = typeof s.url === 'string' && s.url ? s.url : (typeof s.u === 'string' ? s.u : '');
+    if (!url || url.startsWith('local://') || url.length > 300 || seen.has(url)) continue;
+    seen.add(url);
+    const title = String(s.title || s.t || '').slice(0, 150);
+    const artist = String(s.artist || s.a || '').slice(0, 100);
+    const thumb = s.thumb ? String(s.thumb).slice(0, 300) : (s.i ? String(s.i).slice(0, 300) : null);
     out.push({
-      title: String(s.title || '').slice(0, 150),
-      artist: String(s.artist || '').slice(0, 100),
-      url: s.url,
-      thumb: s.thumb ? String(s.thumb).slice(0, 300) : null
+      title,
+      artist,
+      url,
+      thumb,
+      t: title,
+      a: artist,
+      u: url,
+      i: thumb || ''
     });
   }
   return out;
@@ -342,14 +417,21 @@ async function handle(req, res, path, body, ip, reply) {
 
   switch (path) {
     case '/social/heartbeat':
-      me.lastSeen = Date.now();
+      {
+        const wasOnline = isOnline(me);
+        me.lastSeen = Date.now();
+        // İlk sinyalde (yeni açıldı) ve sonra 2 dakikada bir kalıcı yaz: uygulama aniden kapansa da son görülme kaybolmaz
+        if (!wasOnline || me.lastSeen - (me.seenAt || 0) > SEEN_PERSIST_MS) { me.seenAt = me.lastSeen; touch(me); }
+      }
       me.playing = cleanPlaying(body.playing);   // gönderilmezse "dinlemiyor" sayılır
       reply(res, 200, Object.assign({ ok: true }, snapshot(me)));
       return true;
 
     case '/social/offline':
       me.lastSeen = Date.now() - ONLINE_MS;   // çevrim dışı say ama son görülme zamanı kalsın
+      me.seenAt = Date.now();                 // ... ve kalıcı olarak kaydedilsin
       me.playing = null;
+      touch(me);
       reply(res, 200, { ok: true });
       return true;
 
@@ -421,6 +503,52 @@ async function handle(req, res, path, body, ip, reply) {
       return true;
     }
 
+        case '/social/profile-song-set': {
+      if (!body.song || typeof body.song !== 'object') { reply(res, 400, { error: 'Geçersiz şarkı.' }); return true; }
+      const s = body.song;
+      me.profileSong = {
+        title: String(s.title || s.t || '').slice(0, 150),
+        artist: String(s.artist || s.a || '').slice(0, 100),
+        url: String(s.url || s.u || '').slice(0, 300),
+        thumb: s.thumb || s.i ? String(s.thumb || s.i).slice(0, 300) : null
+      };
+      touch(me);
+      reply(res, 200, { ok: true, profileSong: me.profileSong });
+      return true;
+    }
+
+    case '/social/profile-song-clear': {
+      me.profileSong = null;
+      touch(me);
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
+    case '/social/status-set': {
+      const text = String(body.text || '').trim().slice(0, 150);
+      let s = null;
+      if (body.song && typeof body.song === 'object') {
+        const bs = body.song;
+        s = {
+          title: String(bs.title || bs.t || '').slice(0, 150),
+          artist: String(bs.artist || bs.a || '').slice(0, 100),
+          url: String(bs.url || bs.u || '').slice(0, 300),
+          thumb: bs.thumb || bs.i ? String(bs.thumb || bs.i).slice(0, 300) : null
+        };
+      }
+      me.status = { text, song: s, createdAt: Date.now() };
+      touch(me);
+      reply(res, 200, { ok: true, status: me.status });
+      return true;
+    }
+
+    case '/social/status-clear': {
+      me.status = null;
+      touch(me);
+      reply(res, 200, { ok: true });
+      return true;
+    }
+
     case '/social/display-name': {
       const n = String(body.name || '').trim().slice(0, 30);
       if (!n) { reply(res, 400, { error: 'Ad boş olamaz.' }); return true; }
@@ -462,7 +590,7 @@ async function handle(req, res, path, body, ip, reply) {
     case '/social/avatar-set': {
       if (Date.now() - (me.avatarAt || 0) < 3000) { reply(res, 429, { error: 'Biraz bekleyip tekrar dene.' }); return true; }
       const b64 = String(body.image || '');
-      if (b64.length > 100000) { reply(res, 400, { error: 'Fotoğraf çok büyük.' }); return true; }
+      if (b64.length > 280000) { reply(res, 400, { error: 'Fotoğraf çok büyük.' }); return true; }
       const buf = Buffer.from(b64, 'base64');
       const jpeg = buf.length > 100 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
       if (!jpeg || buf.length > AVATAR_MAX) { reply(res, 400, { error: 'Geçersiz fotoğraf.' }); return true; }
@@ -483,6 +611,19 @@ async function handle(req, res, path, body, ip, reply) {
       touch(me);
       if (old) { avatarCache.delete(old); blobDel(old).catch(() => {}); }
       reply(res, 200, { ok: true });
+      return true;
+    }
+
+    case '/social/cover-set': {
+      const b64 = String(body.image || '');
+      if (b64.length > 280000) { reply(res, 400, { error: 'Fotoğraf çok büyük.' }); return true; }
+      const buf = Buffer.from(b64, 'base64');
+      const jpeg = buf.length > 100 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+      if (!jpeg || buf.length > AVATAR_MAX) { reply(res, 400, { error: 'Geçersiz fotoğraf.' }); return true; }
+      const id = crypto.randomBytes(8).toString('hex');
+      try { await blobSet(id, buf); } catch (e) { console.error('Kapak kaydı:', e.message); reply(res, 503, { error: 'Fotoğraf kaydedilemedi. Tekrar dene.' }); return true; }
+      cachePut(id, buf);
+      reply(res, 200, { ok: true, id, url: `/social/avatar/${id}` });
       return true;
     }
 
@@ -526,10 +667,72 @@ async function handle(req, res, path, body, ip, reply) {
       if (Buffer.byteLength(JSON.stringify(lib)) > LIB_MAX_BYTES) { reply(res, 413, { error: 'Kitaplık çok büyük, kaydedilemedi.' }); return true; }
       if (!me.libId) me.libId = crypto.randomBytes(12).toString('hex');
       try { await libSet(me.libId, lib); } catch (e) { console.error('Kitaplık kaydı:', e.message); reply(res, 503, { error: 'Kitaplık kaydedilemedi. Tekrar dene.' }); return true; }
+      me.pubLists = lib.playlists.filter((p) => (p.pub === true || p.pub === 'true'))
+        .map((p) => ({ id: p.id, name: p.name, count: (p.songs || []).length, cover: p.cover || coverOf(p.songs) }));
       me.libSetAt = Date.now();
       me.libAt = Math.max(Date.now(), (me.libAt || 0) + 1);
       touch(me);
       reply(res, 200, { ok: true, updatedAt: me.libAt });
+      return true;
+    }
+
+    case '/social/user-lists': {
+      const t = users[lc(body.username)];
+      if (!t) { reply(res, 404, { error: 'Kullanıcı bulunamadı.' }); return true; }
+      if (!t.libId) { reply(res, 200, { lists: [] }); return true; }
+      let lib;
+      try { lib = await libGet(t.libId); } catch (e) { console.error('Kullanıcı listeleri:', e.message); reply(res, 503, { error: 'Listeler okunamadı. Biraz sonra tekrar dene.' }); return true; }
+      const mine = me ? lc(me.username) : '';
+      const lists = ((lib && lib.playlists) || []).filter((p) => p && (p.pub === true || p.pub === 'true'))
+        .slice(0, 50).map((p) => {
+          const songs = Array.isArray(p.songs) ? p.songs : [];
+          const likers = (t.likes && t.likes[p.id]) || [];
+          return { id: p.id, name: p.name, cover: p.cover || coverOf(songs), songs: songs.slice(0, 300), likes: likers.length, liked: likers.includes(mine) };
+        });
+      reply(res, 200, { lists });
+      return true;
+    }
+
+    case '/social/public-lists': {
+      const mine = me ? lc(me.username) : '';
+      const all = [];
+      for (const u of Object.values(users)) {
+        if (!Array.isArray(u.pubLists)) continue;
+        for (const p of u.pubLists) {
+          const likers = (u.likes && u.likes[p.id]) || [];
+          all.push({ owner: u.username, ownerName: dname(u), avatar: u.avatar || null, id: p.id, name: p.name, count: p.count, cover: p.cover,
+            likes: likers.length, liked: likers.includes(mine) });
+        }
+      }
+      all.sort((a, b) => b.likes - a.likes || b.count - a.count);
+      reply(res, 200, { lists: all.slice(0, 40) });
+      return true;
+    }
+
+    case '/social/public-list': {
+      const t = users[lc(body.username)];
+      const id = String(body.id || '');
+      if (!t || !t.libId || !Array.isArray(t.pubLists) || !t.pubLists.some((p) => p.id === id)) { reply(res, 404, { error: 'Liste herkese açık değil veya silinmiş.' }); return true; }
+      let lib;
+      try { lib = await libGet(t.libId); } catch (e) { console.error('Herkese açık liste:', e.message); reply(res, 503, { error: 'Liste okunamadı. Biraz sonra tekrar dene.' }); return true; }
+      const p = ((lib && lib.playlists) || []).find((x) => x && x.id === id && (x.pub === true || x.pub === 'true') && Array.isArray(x.songs));
+      if (!p) { reply(res, 404, { error: 'Liste herkese açık değil veya silinmiş.' }); return true; }
+      const songs = Array.isArray(p.songs) ? p.songs : [];
+      const likers = (t.likes && t.likes[id]) || [];
+      reply(res, 200, { list: { id: p.id, name: p.name, cover: p.cover || coverOf(songs), songs: songs.slice(0, 300), likes: likers.length, liked: likers.includes(me ? lc(me.username) : '') } });
+      return true;
+    }
+
+    case '/social/list-like': {
+      const t = users[lc(body.username)];
+      const id = String(body.id || '');
+      if (!t || !Array.isArray(t.pubLists) || !t.pubLists.some((p) => p.id === id)) { reply(res, 404, { error: 'Liste herkese açık değil.' }); return true; }
+      if (!t.likes || typeof t.likes !== 'object') t.likes = {};
+      const set = new Set(t.likes[id] || []);
+      if (body.like === false) set.delete(lc(me.username)); else set.add(lc(me.username));
+      t.likes[id] = [...set].slice(0, 5000);
+      touch(t);
+      reply(res, 200, { ok: true, likes: set.size });
       return true;
     }
 
@@ -554,5 +757,5 @@ if (!useRedis) console.warn('UYARI: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_
 module.exports = {
   handle, serveAvatar, ensureLoaded, flushNow,
   persistent: useRedis, redis, useRedis,
-  createUser, issueToken, userExists, generateId, setDisplayName, joinAllowed, validName, lc, sha
+  createUser, issueToken, userExists, generateId, renameUser, setDisplayName, joinAllowed, validName, lc, sha
 };

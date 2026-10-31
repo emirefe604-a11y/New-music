@@ -44,7 +44,7 @@ Hesaplar da aynı adresi kullanır.
 - **Beğeniler ve listeler:** hesaba kaydedilir (`/social/library-get`, `/social/library-set`). Uygulama her değişiklikten 2 sn sonra yedekler;
   uygulamayı silip kursan bile giriş yapınca beğendiklerin ve çalma listelerin geri gelir. Cihazdan yüklenen şarkılar (`local://`) sunucuya gitmez.
   Kitaplık Upstash'ta `l:<id>` anahtarında saklanır (en fazla ~700 KB: yaklaşık 2000-3000 şarkı). Upstash yoksa bu da her yeniden başlatmada silinir.
-- **Arkadaş kimliği:** hesap oluşturulunca e-postadan otomatik üretilir (örn. `emir_4821`), kullanıcı isim bulmak zorunda kalmaz.
+- **Arkadaş kimliği:** hesap oluşturulunca otomatik ve rastgele üretilir (örn. `sd_a1b2c3`); e-posta adresi kimlikte ASLA kullanılmaz. Eski e-posta kökenli kimlikler girişte rastgele kimliğe çevrilir.
   Arkadaşlar bu kimlikle eklenir. **Görünen ad** ise istenen her ad olabilir, benzersiz olmak zorunda değildir ve istediğinde değişir.
 - **Blend:** uygulama en çok dinlediğin sanatçıları sunucuya yollar; yalnızca arkadaşların görür. Arkadaşına dokununca
   iki tarafın sanatçı dağılımlarının kesişimine göre uyum yüzdesi hesaplanır.
@@ -58,3 +58,5 @@ Hesaplar da aynı adresi kullanır.
 - Aynı e-postaya 15 dakikada en fazla 10 yanlış şifre denenebilir; IP başına istek sınırı vardır.
 - Şifre sıfırlanınca eski oturumlar kapanır. Bir hesapla en fazla 5 cihaz oturumu açık kalır.
 - Profil fotoğrafları (256x256 JPEG, en fazla 64 KB) Upstash'ta saklanır.
+- **Son görülme:** çevrim dışı arkadaşlarda gri nokta ve "Son görülme · ..." yazar, çevrim içiyken yeşil nokta görünür. Son görülme zamanı kalıcıdır (sunucu yeniden başlasa da kaybolmaz).
+- **Herkese açık listeler:** `/social/public-lists` (Keşfet), `/social/public-list` (tek liste, şarkılarıyla). Liste kapağı, kapağı olan ilk şarkının resmidir.
