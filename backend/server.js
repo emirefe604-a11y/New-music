@@ -70,7 +70,7 @@ http.createServer(async (req, res) => {
         const cover = u.searchParams.get('cover') || '';
         const query = `name=${encodeURIComponent(name)}&id=${encodeURIComponent(id)}&url=${encodeURIComponent(ytUrl)}&user=${encodeURIComponent(user)}`;
         const customUrl = `newmusic://playlist?${query}`;
-        const intentUrl = `intent://playlist?${query}#Intent;scheme=newmusic;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;end`;
+        const intentUrl = `intent://playlist?${query}#Intent;scheme=newmusic;package=com.example.newmusic;category=android.intent.category.BROWSABLE;end`;
 
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         return res.end(`<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -193,7 +193,7 @@ http.createServer(async (req, res) => {
           </style>
         </head>
         <body>
-          <div class="spotify-card" onclick="openApp()" role="button" tabindex="0">
+          <a href="${intentUrl}" class="spotify-card" style="text-decoration:none;display:block;">
             <div class="cover-wrap">
               ${cover ? `<img src="${cover}" class="cover-img" alt="${name}">` : `<div style="font-size:64px;">🎶</div>`}
               <div class="play-badge">
@@ -202,9 +202,9 @@ http.createServer(async (req, res) => {
             </div>
             <h2 class="title">${name}</h2>
             <p class="subtitle">${user ? user + ' • ' : ''}Sounddeep Çalma Listesi</p>
-            <a href="${customUrl}" class="btn" onclick="openApp(); return false;">Sounddeep'te Dinle</a>
+            <div class="btn">Sounddeep'te Dinle</div>
             <div class="hint">Kapağa veya butona dokunarak doğrudan Sounddeep'te açabilirsiniz.</div>
-          </div>
+          </a>
         </body></html>`);
       }
 
@@ -216,7 +216,7 @@ http.createServer(async (req, res) => {
       const ytUrl = v ? 'https://www.youtube.com/watch?v=' + v : 'https://www.youtube.com';
       const thumb = v ? `https://i.ytimg.com/vi/${v}/hqdefault.jpg` : '';
       const customUrl = `newmusic://play?url=${encodeURIComponent(ytUrl)}`;
-      const intentUrl = `intent://play?url=${encodeURIComponent(ytUrl)}#Intent;scheme=newmusic;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;end`;
+      const intentUrl = `intent://play?url=${encodeURIComponent(ytUrl)}${title ? `&title=${encodeURIComponent(title)}` : ''}${artist ? `&artist=${encodeURIComponent(artist)}` : ''}#Intent;scheme=newmusic;package=com.example.newmusic;category=android.intent.category.BROWSABLE;end`;
 
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -232,10 +232,10 @@ http.createServer(async (req, res) => {
         ${thumb ? `<meta name="twitter:image" content="${thumb}">` : ''}
         <script>
           function openApp() {
-            try { window.location.href = "${customUrl}"; } catch(e) {}
+            try { window.location.href = "${intentUrl}"; } catch(e) {}
             setTimeout(function() {
-              try { window.location.href = "${intentUrl}"; } catch(e) {}
-            }, 120);
+              try { window.location.href = "${customUrl}"; } catch(e) {}
+            }, 300);
           }
           openApp();
           document.addEventListener('DOMContentLoaded', openApp);
@@ -342,7 +342,7 @@ http.createServer(async (req, res) => {
         </style>
       </head>
       <body>
-        <div class="spotify-card" onclick="openApp()" role="button" tabindex="0">
+        <a href="${intentUrl}" class="spotify-card" style="text-decoration:none;display:block;">
           <div class="cover-wrap">
             ${thumb ? `<img src="${thumb}" class="cover-img" alt="${title}">` : `<div style="font-size:64px;">🎵</div>`}
             <div class="play-badge">
@@ -351,9 +351,9 @@ http.createServer(async (req, res) => {
           </div>
           <h2 class="title">${title}</h2>
           ${artist ? `<p class="artist">${artist}</p>` : ''}
-          <a href="${customUrl}" class="btn" onclick="openApp(); return false;">Sounddeep'te Dinle</a>
+          <div class="btn">Sounddeep'te Dinle</div>
           <div class="hint">Kapağa veya butona dokunarak doğrudan Sounddeep'te açabilirsiniz.</div>
-        </div>
+        </a>
       </body></html>`);
     }
 

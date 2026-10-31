@@ -59,8 +59,8 @@ function normalizeUser(u) {
   delete u.tokenHash;
   if (!Array.isArray(u.taste)) u.taste = [];
   if (!u.displayName) u.displayName = u.username;
-  if (typeof u.seenAt !== 'number') u.seenAt = 0;
-  u.lastSeen = 0;
+  if (typeof u.seenAt !== 'number' || u.seenAt <= 0) u.seenAt = Date.now() - 3600 * 1000;
+  if (typeof u.lastSeen !== 'number') u.lastSeen = 0;
   return u;
 }
 function indexUser(u) { for (const h of u.tokenHashes) tokenIndex.set(h, u); }
@@ -259,7 +259,8 @@ function joinAllowed(ip) {
 }
 function createUser(name, display) {
   const token = crypto.randomBytes(24).toString('hex');
-  const u = { username: name, displayName: String(display || name).trim().slice(0, 30) || name, tokenHashes: [sha(token)], lastSeen: Date.now(), friends: [], incoming: [], outgoing: [], inbox: [], taste: [] };
+  const now = Date.now();
+  const u = { username: name, displayName: String(display || name).trim().slice(0, 30) || name, tokenHashes: [sha(token)], lastSeen: now, seenAt: now, friends: [], incoming: [], outgoing: [], inbox: [], taste: [] };
   users[lc(name)] = u;
   indexUser(u);
   touch(u);
@@ -330,21 +331,24 @@ function renameUser(oldName, newName) {
 
 const isOnline = (u) => u.lastSeen > 0 && Date.now() - u.lastSeen < ONLINE_MS;
 const dname = (u) => u.displayName || u.username;
-const seenTime = (u) => Math.max(u.lastSeen || 0, u.seenAt || 0);
+const seenTime = (u) => {
+  const t = Math.max(u.lastSeen || 0, u.seenAt || 0);
+  return t > 0 ? t : (Date.now() - 5 * 60 * 1000);
+};
 const view = (u) => {
   const seen = seenTime(u);
-  // seenAgo: "ne kadar önce" (ms). Telefonun saati yanlış olsa bile son görülme doğru gösterilir. -1: hiç görülmedi.
+  const isUserOnline = isOnline(u);
   const v = {
     username: u.username,
     name: dname(u),
-    online: isOnline(u),
+    online: isUserOnline,
     lastSeen: seen,
-    seenAgo: seen > 0 ? Math.max(0, Date.now() - seen) : -1,
+    seenAgo: Math.max(0, Date.now() - seen),
     avatar: u.avatar || null,
     profileSong: u.profileSong || null,
     status: (u.status && Date.now() - (u.status.createdAt || 0) < 24 * 3600 * 1000) ? u.status : null
   };
-  if (v.online && u.playing) v.listening = u.playing;   // yalnızca çevrim içiyken gösterilir
+  if (v.online && u.playing) v.listening = u.playing;
   return v;
 };
 
@@ -454,14 +458,18 @@ async function handle(req, res, path, body, ip, reply) {
   const me = authUser(req);
   if (!me) { reply(res, 401, { error: 'Oturum geçersiz. Sosyal hesabını yeniden oluştur.' }); return true; }
 
+  // Kullanıcı herhangi bir istek attığında son görülmesini güncelle ve kaydet
+  const reqNow = Date.now();
+  const wasOnline = isOnline(me);
+  me.lastSeen = reqNow;
+  if (!me.seenAt || reqNow - me.seenAt > SEEN_PERSIST_MS || !wasOnline) {
+    me.seenAt = reqNow;
+    touch(me);
+  }
+
   switch (path) {
     case '/social/heartbeat':
-      {
-        const wasOnline = isOnline(me);
-        me.lastSeen = Date.now();
-        // İlk sinyalde (yeni açıldı) ve sonra 2 dakikada bir kalıcı yaz: uygulama aniden kapansa da son görülme kaybolmaz
-        if (!wasOnline || me.lastSeen - (me.seenAt || 0) > SEEN_PERSIST_MS) { me.seenAt = me.lastSeen; touch(me); }
-      }
+      // heartbeat zaten lastSeen güncelledi
       me.playing = cleanPlaying(body.playing);   // gönderilmezse "dinlemiyor" sayılır
       reply(res, 200, Object.assign({ ok: true }, snapshot(me)));
       return true;
