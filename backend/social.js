@@ -399,6 +399,45 @@ function cleanSongs(songs) {
 }
 
 // handle: yönetildiyse true döner. reply(status, obj) sunucudan gelir.
+async function deleteUser(username) {
+  const k = lc(username);
+  const u = users[k];
+  if (!u) return false;
+  const affected = [];
+  for (const f of u.friends || []) {
+    const friend = users[f];
+    if (friend) { friend.friends = without(friend.friends, k); affected.push(friend); }
+  }
+  for (const f of u.incoming || []) {
+    const friend = users[f];
+    if (friend) { friend.outgoing = without(friend.outgoing, k); affected.push(friend); }
+  }
+  for (const f of u.outgoing || []) {
+    const friend = users[f];
+    if (friend) { friend.incoming = without(friend.incoming, k); affected.push(friend); }
+  }
+  if (affected.length) touch(...affected);
+
+  for (const th of u.tokenHashes || []) tokenIndex.delete(th);
+
+  if (u.avatar) {
+    const id = u.avatar.split('/social/avatar/')[1];
+    if (id) { avatarCache.delete(id); blobDel(id).catch(() => {}); }
+  }
+
+  if (u.libId) {
+    try {
+      if (useRedis) await redis([['DEL', 'l:' + u.libId]]);
+      else await fs.promises.unlink(path.join(LIB_DIR, u.libId + '.json')).catch(() => {});
+    } catch (e) {}
+  }
+
+  delete users[k];
+  removed.add(k);
+  await flushNow();
+  return true;
+}
+
 async function handle(req, res, path, body, ip, reply) {
   if (!path.startsWith('/social/')) return false;
   if (!(await ensureLoaded())) { reply(res, 503, { error: 'Sunucu veritabanına ulaşamıyor. Biraz sonra tekrar dene.' }); return true; }
@@ -746,6 +785,11 @@ async function handle(req, res, path, body, ip, reply) {
       reply(res, 200, { ok: true });
       return true;
 
+    case '/social/delete-account':
+      await deleteUser(me.username);
+      reply(res, 200, { ok: true });
+      return true;
+
     default:
       reply(res, 404, { error: 'Bulunamadı' });
       return true;
@@ -757,5 +801,5 @@ if (!useRedis) console.warn('UYARI: UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_
 module.exports = {
   handle, serveAvatar, ensureLoaded, flushNow,
   persistent: useRedis, redis, useRedis,
-  createUser, issueToken, userExists, generateId, renameUser, setDisplayName, joinAllowed, validName, lc, sha
+  createUser, issueToken, userExists, generateId, renameUser, setDisplayName, joinAllowed, validName, lc, sha, deleteUser
 };

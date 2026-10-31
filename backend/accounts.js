@@ -145,6 +145,20 @@ const cleanName = (n) => String(n || '').trim().slice(0, 30);
 
 // ---------------------------------------------------------------- uç noktalar
 
+async function removeAccount(a) {
+  for (const h of a.sessions || []) sessionIndex.delete(h);
+  delete accounts[a.email];
+  if (a.social) {
+    try { await social.deleteUser(a.social); } catch(e) {}
+  }
+  if (social.useRedis) {
+    await social.redis([['DEL', 'acc:' + a.email], ['SREM', 'accounts', a.email]]);
+    return;
+  }
+  writeChain = writeChain.catch(() => {}).then(() => fs.promises.writeFile(ACC_FILE, JSON.stringify(accounts)));
+  await writeChain;
+}
+
 async function handle(req, res, path, body, ip, reply) {
   if (!path.startsWith('/auth/')) return false;
   if (ipLimited(ip)) { reply(res, 429, { error: 'Çok fazla istek. Biraz sonra tekrar dene.' }); return true; }
@@ -288,6 +302,17 @@ async function handle(req, res, path, body, ip, reply) {
     case '/auth/social-join': {
       // Eski istemciler için: kimlik artık otomatik üretilir, istenen kullanıcı adı yok sayılır
       reply(res, 200, socialFor(acc));
+      return true;
+    }
+
+    case '/auth/delete-account': {
+      try {
+        await removeAccount(acc);
+        reply(res, 200, { ok: true });
+      } catch (e) {
+        console.error('Hesap silme hatası:', e.message);
+        reply(res, 500, { error: 'Hesap silinirken bir hata oluştu.' });
+      }
       return true;
     }
 
