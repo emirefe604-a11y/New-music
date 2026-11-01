@@ -349,7 +349,11 @@ const view = (u) => {
     profileSong: u.profileSong || null,
     status: (u.status && Date.now() - (u.status.createdAt || 0) < 24 * 3600 * 1000) ? u.status : null
   };
-  if (v.online && u.playing) v.listening = u.playing;
+  if (v.online && u.playing) {
+    v.listening = { title: u.playing.title, artist: u.playing.artist, url: u.playing.url, thumb: u.playing.thumb };
+    v.listenPos = u.playing.pos;
+    v.listenAgo = Math.max(0, Date.now() - (u.playing.at || Date.now()));
+  }
   return v;
 };
 
@@ -373,7 +377,8 @@ function snapshot(me) {
 function cleanPlaying(p) {
   if (!p || typeof p !== 'object' || typeof p.title !== 'string' || !p.title) return null;
   const url = typeof p.url === 'string' && !p.url.startsWith('local://') && p.url.length <= 300 ? p.url : '';
-  return { title: p.title.slice(0, 150), artist: String(p.artist || '').slice(0, 100), url, thumb: p.thumb ? String(p.thumb).slice(0, 300) : null };
+  return { title: p.title.slice(0, 150), artist: String(p.artist || '').slice(0, 100), url, thumb: p.thumb ? String(p.thumb).slice(0, 300) : null,
+    pos: Number.isFinite(p.pos) && p.pos >= 0 ? Math.floor(p.pos) : -1, at: Date.now() };   // pos: çalma konumu (ms), at: sunucunun aldığı an
 }
 const without = (arr, x) => arr.filter((v) => v !== x);
 

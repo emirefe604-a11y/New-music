@@ -58,7 +58,9 @@ async function recognize(req, res, ip) {
   }
   if (data && data.status === 'error') {
     console.error('AudD hatası:', data.error && data.error.error_message);
-    return send(res, 502, { error: 'Şarkı tanıma servisi hata verdi.' });
+    const em = (data.error && (data.error.error_message || data.error.message)) || 'bilinmeyen hata';
+    const ec = data.error && data.error.error_code;
+    return send(res, 502, { error: 'Şarkı tanıma servisi hata verdi' + (ec ? ' (' + ec + ')' : '') + ': ' + String(em).slice(0, 140) });
   }
   const m = data && data.result;
   if (!m || !m.title) return send(res, 200, { found: false });
@@ -438,6 +440,7 @@ http.createServer(async (req, res) => {
       </body></html>`);
     }
 
+    if (req.method === 'GET' && path === '/recognize-status') return send(res, 200, { audd: !!process.env.AUDD_TOKEN });
     if (req.method === 'GET' && path.startsWith('/social/avatar/')) return await social.serveAvatar(req, res);
     if (req.method !== 'POST') return send(res, 404, { error: 'Bulunamadı' });
     if (path === '/recognize') return await recognize(req, res, ip);
