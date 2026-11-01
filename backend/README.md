@@ -72,3 +72,13 @@ doğrulanmış App Link olarak tanır; doğrulanırsa link tıklanınca web sayf
 
 Instagram hikaye bağlantıları Instagram'ın kendi tarayıcısında açıldığı için App Link devreye girmez; bu durumda şarkı sayfası uygulamayı
 otomatik açmayı dener, açılmazsa "Sounddeep'te Dinle" düğmesine dokunmak yeterlidir.
+
+## 6) Şarkı tanıma (arama çubuğundaki mikrofon simgesi)
+Uygulama, mikrofondan 10 sn'lik kayıt alıp sunucudaki `POST /recognize` adresine gönderir; sunucu kaydı [AudD](https://audd.io) ile eşleştirir.
+1. audd.io'da hesap aç ve `api_token` değerini al.
+2. Render > Environment: `AUDD_TOKEN` = bu token.
+3. Token yoksa uygulama "Şarkı tanıma henüz sunucuda ayarlanmadı" der. IP başına dakikada en fazla 8 deneme yapılabilir.
+
+## 7) Arkadaş ekleme: profil linki
+Arkadaşlar sekmesindeki "Profil linkimi WhatsApp'tan paylaş" düğmesi `https://new-music-cpzw.onrender.com/add-friend/<kullanıcı>` linkini gönderir.
+Linke basan kişi uygulamada o kişinin profilini görür (`/social/user-profile`) ve **Arkadaş Ekle** düğmesine kendisi basar.

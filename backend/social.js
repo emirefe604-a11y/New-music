@@ -11,6 +11,7 @@
 //  /social/offline         {}                              -> { ok }       (uygulama kapanırken)
 //  /social/friends         {}                              -> { friends, incoming, outgoing }
 //  /social/friend-request  { username }                    -> { ok }
+//  /social/user-profile    { username }                    -> { username, name, avatar, relation }   (profil linki önizlemesi)
 //  /social/friend-respond  { username, accept }            -> { ok }
 //  /social/friend-remove   { username }                    -> { ok }
 //  /social/share           { to: [username], name, songs } -> { ok, sent }
@@ -501,6 +502,20 @@ async function handle(req, res, path, body, ip, reply) {
       }
       touch(me, t);
       reply(res, 200, { ok: true });
+      return true;
+    }
+
+    // Profil linkinden gelen kişinin herkese açık özeti + benimle ilişkisi (friend | incoming | outgoing | none)
+    case '/social/user-profile': {
+      const t = users[lc(body.username)];
+      if (!t) { reply(res, 404, { error: 'Böyle bir kullanıcı yok.' }); return true; }
+      const b = lc(t.username);
+      let relation = 'none';
+      if (lc(me.username) === b) relation = 'self';
+      else if (me.friends.includes(b)) relation = 'friend';
+      else if (me.incoming.includes(b)) relation = 'incoming';
+      else if (me.outgoing.includes(b)) relation = 'outgoing';
+      reply(res, 200, { username: t.username, name: dname(t), avatar: t.avatar || null, relation });
       return true;
     }
 

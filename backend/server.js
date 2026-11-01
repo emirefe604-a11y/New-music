@@ -16,6 +16,55 @@ function send(res, status, obj) {
 
 class BadRequest extends Error {}
 
+function readRaw(req, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { reject(new BadRequest('Ses kaydı çok büyük.')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+// ---- Şarkı tanıma (Shazam benzeri): uygulama birkaç saniyelik mikrofon kaydını gönderir, AudD parmak izi eşleştirir.
+// Render > Environment: AUDD_TOKEN = audd.io hesabındaki api_token
+const recogHits = new Map();   // ip -> [zaman damgaları] (dakikada en fazla 8 deneme)
+async function recognize(req, res, ip) {
+  const token = process.env.AUDD_TOKEN || '';
+  if (!token) return send(res, 503, { error: 'Şarkı tanıma henüz sunucuda ayarlanmadı (AUDD_TOKEN).' });
+  const now = Date.now();
+  const hits = (recogHits.get(ip) || []).filter((t) => now - t < 60000);
+  if (hits.length >= 8) return send(res, 429, { error: 'Çok fazla deneme. Biraz bekle.' });
+  hits.push(now); recogHits.set(ip, hits);
+
+  const audio = await readRaw(req, 2 * 1024 * 1024);
+  if (audio.length < 4000) return send(res, 400, { error: 'Ses kaydı çok kısa.' });
+
+  const form = new FormData();
+  form.append('api_token', token);
+  form.append('return', 'apple_music,spotify');
+  form.append('file', new Blob([audio], { type: 'audio/mp4' }), 'kayit.m4a');
+  let data;
+  try {
+    const r = await fetch('https://api.audd.io/', { method: 'POST', body: form, signal: AbortSignal.timeout(25000) });
+    data = await r.json();
+  } catch (e) {
+    console.error('Şarkı tanıma hatası:', e && e.message);
+    return send(res, 502, { error: 'Şarkı tanıma servisine ulaşılamadı.' });
+  }
+  if (data && data.status === 'error') {
+    console.error('AudD hatası:', data.error && data.error.error_message);
+    return send(res, 502, { error: 'Şarkı tanıma servisi hata verdi.' });
+  }
+  const m = data && data.result;
+  if (!m || !m.title) return send(res, 200, { found: false });
+  send(res, 200, { found: true, title: String(m.title), artist: String(m.artist || ''), album: String(m.album || '') });
+}
+
 function readJson(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -54,7 +103,7 @@ http.createServer(async (req, res) => {
         const customUrl = "newmusic://add-friend/" + u;
         window.location.href = customUrl;
         setTimeout(() => { window.location.href = intentUrl; }, 400);
-      </script><style>body{background:#070B14;color:#fff;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:20px;}a{display:inline-block;padding:16px 32px;background:#4D8DFF;color:#fff;text-decoration:none;border-radius:28px;font-weight:bold;margin-top:20px;font-size:16px;box-shadow:0 8px 24px rgba(77,141,255,0.3);}</style></head><body><div><div style="font-size:48px;margin-bottom:12px;">🎵</div><h2>Sounddeep'te Arkadaş Ol!</h2><p style="color:#9A9A9A;font-size:14px;max-width:320px;margin:0 auto;">Birlikte müzik dinlemek ve ortak Blend listeleri oluşturmak için aşağıdaki butona dokun:</p><a href="intent://add-friend/${encodeURIComponent(user)}#Intent;scheme=newmusic;end">Uygulamada Aç ve Arkadaş Ekle</a></div></body></html>`);
+      </script><style>body{background:#070B14;color:#fff;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:20px;}a{display:inline-block;padding:16px 32px;background:#4D8DFF;color:#fff;text-decoration:none;border-radius:28px;font-weight:bold;margin-top:20px;font-size:16px;box-shadow:0 8px 24px rgba(77,141,255,0.3);}</style></head><body><div><div style="font-size:48px;margin-bottom:12px;">🎵</div><h2>Sounddeep Profili</h2><p style="color:#9A9A9A;font-size:14px;max-width:320px;margin:0 auto;">Profili görmek ve arkadaş olarak eklemek için aşağıdaki butona dokun:</p><a href="intent://add-friend/${encodeURIComponent(user)}#Intent;scheme=newmusic;end">Profili Uygulamada Aç</a></div></body></html>`);
     }
 
     // Android App Links doğrulaması: link tıklanınca tarayıcı/sayfa açılmadan doğrudan uygulama açılır.
@@ -391,6 +440,7 @@ http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && path.startsWith('/social/avatar/')) return await social.serveAvatar(req, res);
     if (req.method !== 'POST') return send(res, 404, { error: 'Bulunamadı' });
+    if (path === '/recognize') return await recognize(req, res, ip);
 
     const limit = path === '/social/library-set' ? 1024 * 1024 : (path === '/social/avatar-set' || path === '/social/cover-set') ? 512 * 1024 : path.startsWith('/social/') ? 200 * 1024 : 8 * 1024;
     const body = await readJson(req, limit);
