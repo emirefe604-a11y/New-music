@@ -57,6 +57,17 @@ http.createServer(async (req, res) => {
       </script><style>body{background:#070B14;color:#fff;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center;padding:20px;}a{display:inline-block;padding:16px 32px;background:#4D8DFF;color:#fff;text-decoration:none;border-radius:28px;font-weight:bold;margin-top:20px;font-size:16px;box-shadow:0 8px 24px rgba(77,141,255,0.3);}</style></head><body><div><div style="font-size:48px;margin-bottom:12px;">🎵</div><h2>Sounddeep'te Arkadaş Ol!</h2><p style="color:#9A9A9A;font-size:14px;max-width:320px;margin:0 auto;">Birlikte müzik dinlemek ve ortak Blend listeleri oluşturmak için aşağıdaki butona dokun:</p><a href="intent://add-friend/${encodeURIComponent(user)}#Intent;scheme=newmusic;end">Uygulamada Aç ve Arkadaş Ekle</a></div></body></html>`);
     }
 
+    // Android App Links doğrulaması: link tıklanınca tarayıcı/sayfa açılmadan doğrudan uygulama açılır.
+    // Render > Environment: ANDROID_CERT_SHA256 = APK imza sertifikasının SHA-256 parmak izi (virgülle birden fazla yazılabilir).
+    if (req.method === 'GET' && path === '/.well-known/assetlinks.json') {
+      const fps = (process.env.ANDROID_CERT_SHA256 || '').split(',').map((s) => s.trim()).filter(Boolean);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+      return res.end(JSON.stringify([{
+        relation: ['delegate_permission/common.handle_all_urls'],
+        target: { namespace: 'android_app', package_name: 'com.example.newmusic', sha256_cert_fingerprints: fps }
+      }]));
+    }
+
     // Şarkı veya Çalma listesi paylaşımı doğrudan uygulamada açma yönlendirmesi (Spotify tarzı kart & kapak)
     if (req.method === 'GET' && (path === '/song' || path.startsWith('/song/') || path.startsWith('/s/') || path === '/playlist' || path.startsWith('/playlist/') || path.startsWith('/p/'))) {
       const u = new URL(req.url, 'https://new-music-cpzw.onrender.com');
@@ -208,15 +219,19 @@ http.createServer(async (req, res) => {
         </body></html>`);
       }
 
+      const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
       const pathSongId = path.startsWith('/s/') ? path.slice('/s/'.length) : (path.startsWith('/song/') ? path.slice('/song/'.length) : '');
-      const v = pathSongId || (req.url.split('v=')[1] || '').split('&')[0];
-      const title = u.searchParams.get('title') || 'Şarkıyı Dinle';
-      const artist = u.searchParams.get('artist') || '';
+      const vRaw = pathSongId || (req.url.split('v=')[1] || '').split('&')[0];
+      const v = /^[A-Za-z0-9_-]{11}$/.test(vRaw) ? vRaw : '';
+      const rawTitle = u.searchParams.get('title') || 'Şarkıyı Dinle';
+      const rawArtist = u.searchParams.get('artist') || '';
+      const title = esc(rawTitle);
+      const artist = esc(rawArtist);
       const fullTitle = artist ? `${title} – ${artist}` : title;
       const ytUrl = v ? 'https://www.youtube.com/watch?v=' + v : 'https://www.youtube.com';
       const thumb = v ? `https://i.ytimg.com/vi/${v}/hqdefault.jpg` : '';
       const customUrl = `newmusic://play?url=${encodeURIComponent(ytUrl)}`;
-      const intentUrl = `intent://play?url=${encodeURIComponent(ytUrl)}${title ? `&title=${encodeURIComponent(title)}` : ''}${artist ? `&artist=${encodeURIComponent(artist)}` : ''}#Intent;scheme=newmusic;package=com.example.newmusic;category=android.intent.category.BROWSABLE;end`;
+      const intentUrl = `intent://play?url=${encodeURIComponent(ytUrl)}${rawTitle ? `&title=${encodeURIComponent(rawTitle)}` : ''}${rawArtist ? `&artist=${encodeURIComponent(rawArtist)}` : ''}#Intent;scheme=newmusic;package=com.example.newmusic;category=android.intent.category.BROWSABLE;end`;
 
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(`<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -231,15 +246,31 @@ http.createServer(async (req, res) => {
         <meta name="twitter:title" content="${fullTitle}">
         ${thumb ? `<meta name="twitter:image" content="${thumb}">` : ''}
         <script>
-          function openApp() {
-            try { window.location.href = "${intentUrl}"; } catch(e) {}
-            setTimeout(function() {
-              try { window.location.href = "${customUrl}"; } catch(e) {}
-            }, 300);
-          }
-          openApp();
-          document.addEventListener('DOMContentLoaded', openApp);
-          window.addEventListener('load', openApp);
+          (function () {
+            var ua = navigator.userAgent || '';
+            var android = /Android/i.test(ua);
+            var inApp = /Instagram|FBAN|FBAV|FB_IAB|Messenger/i.test(ua);
+            var intentUrl = ${JSON.stringify(intentUrl)};
+            var customUrl = ${JSON.stringify(customUrl)};
+            var busy = false;
+            window.openApp = function () {
+              if (busy) return;
+              busy = true;
+              setTimeout(function () { busy = false; }, 1500);
+              if (android) {
+                window.location.href = intentUrl;
+                // Uygulama açılmadıysa (sayfa hâlâ görünüyorsa) özel şemayı dene
+                setTimeout(function () { if (document.visibilityState === 'visible') window.location.href = customUrl; }, 700);
+              } else {
+                window.location.href = customUrl;
+              }
+            };
+            window.openApp();
+            document.addEventListener('DOMContentLoaded', function () {
+              var h = document.getElementById('inapp');
+              if (h && inApp) h.style.display = 'block';
+            });
+          })();
         </script>
         <style>
           * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -342,7 +373,7 @@ http.createServer(async (req, res) => {
         </style>
       </head>
       <body>
-        <a href="${intentUrl}" class="spotify-card" style="text-decoration:none;display:block;">
+        <a href="${esc(intentUrl)}" class="spotify-card" style="text-decoration:none;display:block;" onclick="openApp();return false;">
           <div class="cover-wrap">
             ${thumb ? `<img src="${thumb}" class="cover-img" alt="${title}">` : `<div style="font-size:64px;">🎵</div>`}
             <div class="play-badge">
@@ -353,6 +384,7 @@ http.createServer(async (req, res) => {
           ${artist ? `<p class="artist">${artist}</p>` : ''}
           <div class="btn">Sounddeep'te Dinle</div>
           <div class="hint">Kapağa veya butona dokunarak doğrudan Sounddeep'te açabilirsiniz.</div>
+          <div class="hint" id="inapp" style="display:none;color:#b3b3b3;">Instagram içinde açılmadıysa sağ üstteki ⋯ menüsünden “Tarayıcıda aç” seçip tekrar dene.</div>
         </a>
       </body></html>`);
     }

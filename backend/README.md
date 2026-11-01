@@ -60,3 +60,15 @@ Hesaplar da aynı adresi kullanır.
 - Profil fotoğrafları (256x256 JPEG, en fazla 64 KB) Upstash'ta saklanır.
 - **Son görülme:** çevrim dışı arkadaşlarda gri nokta ve "Son görülme · ..." yazar, çevrim içiyken yeşil nokta görünür. Son görülme zamanı kalıcıdır (sunucu yeniden başlasa da kaybolmaz).
 - **Herkese açık listeler:** `/social/public-lists` (Keşfet), `/social/public-list` (tek liste, şarkılarıyla). Liste kapağı, kapağı olan ilk şarkının resmidir.
+
+
+## 5) Şarkı linkine tıklayınca doğrudan uygulamada açılması (Android App Links)
+Paylaşılan şarkı/liste linkleri `https://new-music-cpzw.onrender.com/s/<id>` biçimindedir. Uygulama bu adresleri
+doğrulanmış App Link olarak tanır; doğrulanırsa link tıklanınca web sayfası açılmadan doğrudan Sounddeep'te büyük oynatıcı açılır.
+1. APK'nı imzalayan sertifikanın SHA-256 parmak izini al (`keytool -list -v -keystore <anahtar>` veya Play Console > Uygulama imzalama).
+2. Render > Environment: `ANDROID_CERT_SHA256` = bu parmak izi (birden fazla ise virgülle ayır).
+3. Kontrol: `https://new-music-cpzw.onrender.com/.well-known/assetlinks.json` adresinde parmak izini görmelisin.
+4. Uygulamayı yeniden kur (doğrulama kurulumda yapılır).
+
+Instagram hikaye bağlantıları Instagram'ın kendi tarayıcısında açıldığı için App Link devreye girmez; bu durumda şarkı sayfası uygulamayı
+otomatik açmayı dener, açılmazsa "Sounddeep'te Dinle" düğmesine dokunmak yeterlidir.
